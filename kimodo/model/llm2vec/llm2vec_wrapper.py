@@ -68,18 +68,26 @@ class LLM2VecEncoder:
             text = [text]
             is_string = True
 
+        # NOTE: We bypass LLM2Vec.encode() and call _encode() directly per
+        # sentence. encode()'s "multi-GPU" branch (torch.cuda.device_count()>1)
+        # spawns a multiprocessing.Pool with one worker per visible GPU. Under
+        # DDP every rank sees all GPUs, so 8 ranks each spawn 8 workers = 64
+        # CUDA worker procs that contend for memory and crash with OOM /
+        # "invalid device context" during pool teardown.
+        #
+        # Using batch_size=1 (as before) for repeatability — different batch
+        # sizes change the output embeddings due to a transformers quirk:
+        # https://github.com/huggingface/transformers/issues/25420
+        sentences = [[""] + [t] for t in text]
+        concatenated = [self.model._convert_to_str(s[0], s[1]) for s in sentences]
+        self.model.eval()
         with torch.no_grad():
-            encoded_text = self.model.encode(
-                text,
-                # IMPORTANT: different batch sizes unexpectedly change the output embeddings, so we always set it to 1
-                #            here for repeatability no matter how many texts are being encoded. This
-                #            is a fundamental issue with transformers, and is especially bad at lower
-                #            precisions (https://github.com/huggingface/transformers/issues/25420#issuecomment-1775317535)
-                #            note: this is an internal batch size used by llm2vec - the text list can still be of arbitrary length.
-                batch_size=1,
-                show_progress_bar=False,
-                device=self._device,
-            )
+            chunks = []
+            for s in concatenated:
+                chunks.append(
+                    self.model._encode([s], device=self._device, convert_to_numpy=False)
+                )
+            encoded_text = torch.cat(chunks, dim=0).to(torch.float32)
 
         assert len(encoded_text.shape)
         assert self.llm_dim == encoded_text.shape[-1]

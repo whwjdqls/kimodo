@@ -1,0 +1,87 @@
+# Default training config for Kimodo text-to-motion (SOMA, 20 fps).
+# Override fields on the command line like:
+#   python -m kimodo.scripts.train trainer.batch_size=64 trainer.lr=1e-5 ...
+
+# ----- data -----
+data:
+  data_root: /weka/jungbin/seed/soma_uniform_motions_20fps
+  temporal_labels_path: /weka/jungbin/seed/metadata/seed_metadata_v002_temporal_labels.jsonl
+  fps: 20
+  min_frames: 10          # 0.5 s at 20 fps — drop sub-second snippets
+  max_frames: 200         # 10 s at 20 fps (cap; pad if shorter)
+  include_mirrored: true
+  random_heading_aug: true
+  cache_index: ${output_dir}/segment_index.json
+  num_workers: 8
+  pin_memory: true
+
+# ----- model -----
+# The model schema (motion_rep / denoiser) lives in the KIMODO checkpoint
+# directory. We merge it in at runtime via OmegaConf.
+model_config_path: /weka/jungbin/Kimodo-SOMA-SEED-v1.1/config.yaml
+stats_path: /weka/jungbin/seed/stats/soma_uniform_motions_20fps_0521_2210
+# Override the denoiser fps (training data is at 20 fps).
+denoiser_fps_override: 20
+# Optional: load weights from an existing safetensors file to fine-tune.
+# Set to null to train from scratch.
+init_from_safetensors: null
+
+# ----- text encoder -----
+text_encoder:
+  type: llm2vec
+  device: auto           # 'auto' uses the same device as the model
+  fp32: false
+
+# ----- training loop -----
+trainer:
+  output_dir: ${output_dir}
+  batch_size: 32         # per GPU
+  grad_accum: 1
+  num_steps: 1000000
+  lr: 2.0e-5             # KIMODO paper uses 2e-5 with Adam-atan2
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  warmup_steps: 1000
+  log_every: 50
+  ckpt_every: 5000
+  viz_every: 5000        # set to 0 to disable in-training viz
+  eval_every: 0          # 0 disables held-out eval for now
+  text_drop_prob: 0.1    # CFG drop for text-only training (KIMODO paper)
+  ema_decay: 0.995
+  ema_every: 10
+  mixed_precision: bf16  # 'fp32', 'fp16', 'bf16'
+  grad_clip: 1.0
+  resume_from: null      # set to checkpoint .pt path to resume
+  seed: 0
+  # Loss weights per KIMODO paper (eq. component weights gamma_1..gamma_7).
+  loss_weights:
+    smooth_root_pos: 10.0       # gamma_1
+    global_root_heading: 2.0    # gamma_2
+    local_joints_positions: 10.0 # gamma_3
+    velocities: 3.0             # gamma_4
+    global_rot_data: 10.0       # gamma_5
+    foot_contacts: 4.0          # gamma_6
+    fk: 5.0                     # gamma_7 (FK consistency: FK(pred rots) vs GT positions)
+  smooth_l1_beta: 1.0
+  phase: text                   # 'text' (phase 1) or 'constraints' (phase 2)
+  # Phase-2 constraint family distribution (used when phase == 'constraints'):
+  constraint_weights:
+    none: 0.40                  # text-only step (mixed in for robustness)
+    fullbody_keyframes: 0.20
+    fullbody_inbetween: 0.10
+    root_waypoints: 0.10
+    root_path: 0.10
+    ee_keyframes: 0.10
+
+# ----- visualization -----
+viz:
+  num_samples: 2
+  prompts:
+    - "a person is walking forward."
+    - "a person is jumping in place."
+  num_frames: 100
+  num_denoising_steps: 50
+  cfg_weight: [2.0, 0.0]
+  save_videos: false      # rendering needs pyrender + GL; default off in training
+
+output_dir: /weka/jungbin/kimodo_runs/run_default

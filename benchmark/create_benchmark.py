@@ -24,6 +24,7 @@ from kimodo.skeleton.bvh import parse_bvh_motion
 from kimodo.tools import load_json, save_json, to_numpy, to_torch
 
 FPS = 30
+SEED_FPS = 30  # Frame indices in seed_motion.json / seed_constraints.json are authored at this FPS.
 BENCHMARK_REPO_ID = "nvidia/Kimodo-Motion-Gen-Benchmark"
 
 
@@ -64,6 +65,9 @@ def constraints_and_motion_from_seed(folder: str, dataset_folder: str, fps=FPS):
 
     start = seed_motion["crop_start_frame_index"]
     end = seed_motion["crop_end_frame_index"]
+    if fps != SEED_FPS:
+        start = round(start * fps / SEED_FPS)
+        end = round(end * fps / SEED_FPS)
 
     bvh_path = dataset_folder / seed_motion["bvh_path"].replace("BVH/", "bvh/")
 
@@ -95,11 +99,15 @@ def constraints_and_motion_from_seed(folder: str, dataset_folder: str, fps=FPS):
     seed_constraints_path = folder / "seed_constraints.json"
     if seed_constraints_path.exists():
         seed_constraints_lst = load_json(seed_constraints_path)
+        motion_len = motion["smooth_root_pos"].shape[0]
 
         constraints_lst = []
         for seed_cons in seed_constraints_lst:
             cons = seed_cons.copy()
             frame_indices = cons["frame_indices"]
+            if fps != SEED_FPS:
+                frame_indices = [min(round(i * fps / SEED_FPS), motion_len - 1) for i in frame_indices]
+                cons["frame_indices"] = frame_indices
 
             cons["smooth_root_2d"] = motion["smooth_root_pos"][frame_indices][..., [0, 2]].tolist()
 
@@ -154,6 +162,12 @@ def main():
         default=1,
         help="Number of parallel worker processes (default: 1, sequential)",
     )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=FPS,
+        help=f"Target FPS to subsample BVH to (default: {FPS}).",
+    )
     args = parser.parse_args()
 
     folder = args.benchmark.resolve()
@@ -174,7 +188,7 @@ def main():
         else:
             to_process.append(d)
 
-    fn = partial(constraints_and_motion_from_seed, dataset_folder=args.dataset)
+    fn = partial(constraints_and_motion_from_seed, dataset_folder=args.dataset, fps=args.fps)
     with Pool(args.workers) as pool:
         list(tqdm(pool.imap_unordered(fn, to_process), total=len(to_process), desc="Extracting GT motions"))
 
