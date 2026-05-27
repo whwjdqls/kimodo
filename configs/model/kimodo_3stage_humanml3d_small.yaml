@@ -1,0 +1,72 @@
+# 3-stage Kimodo model schema for HumanML3D training.
+#
+# Three trainable sub-modules — mask generator (Stage 1), constraint generator
+# (Stage 2), motion denoiser (Stage 3). The training script reads the three
+# sections and instantiates them with a SHARED ``motion_rep``.
+#
+# All three transformers are MDM-base-sized (latent_dim 256–512). The motion
+# denoiser matches ``configs/model/kimodo_humanml3d_small.yaml`` exactly so
+# you can warm-start it from a 2-stage checkpoint if you have one.
+
+motion_denoiser:
+  _target_: kimodo.model.twostage_denoiser.TwostageDenoiser
+  ckpt_path: ${oc.select:checkpoint_dir, null}/model.safetensors
+  motion_mask_mode: concat
+  motion_rep:
+    _target_: kimodo.motion_rep.KimodoMotionRep
+    fps: 20
+    stats_path: ${oc.select:checkpoint_dir, null}/stats/motion/
+    skeleton:
+      _target_: kimodo.skeleton.SMPLXSkeleton22
+  llm_shape:
+  - 1
+  - 4096
+  use_text_mask: false
+  latent_dim: 512
+  ff_size: 1024
+  num_layers: 8
+  num_heads: 4
+  activation: gelu
+  dropout: 0.1
+  pe_dropout: 0.1
+  norm_first: false
+  num_text_tokens_override: 50
+  input_first_heading_angle: true
+
+# Stage 1 (lightweight — single (T, D) output)
+mask_generator:
+  _target_: kimodo.model.mask_generator.MaskGenerator
+  llm_shape:
+  - 1
+  - 4096
+  use_text_mask: false
+  latent_dim: 256
+  ff_size: 512
+  num_layers: 4
+  num_heads: 4
+  activation: gelu
+  dropout: 0.1
+  pe_dropout: 0.1
+  norm_first: false
+  num_text_tokens_override: 50
+
+# Stage 2 (medium — has to predict (T, D) GT-like features)
+constraint_generator:
+  _target_: kimodo.model.constraint_generator.ConstraintGenerator
+  llm_shape:
+  - 1
+  - 4096
+  use_text_mask: false
+  latent_dim: 384
+  ff_size: 768
+  num_layers: 6
+  num_heads: 4
+  activation: gelu
+  dropout: 0.1
+  pe_dropout: 0.1
+  norm_first: false
+  num_text_tokens_override: 50
+
+# Diffusion (used by the training script at the Stage 3 level)
+diffusion:
+  num_base_steps: 1000

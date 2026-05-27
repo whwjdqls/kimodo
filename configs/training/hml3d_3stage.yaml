@@ -1,0 +1,91 @@
+# Training config — 3-stage text-to-motion model on HumanML3D (kimodo features).
+#
+# Train mask generator + constraint generator + motion denoiser jointly,
+# end-to-end. There is no GT mask anywhere — see README_3stage.md.
+
+# ----- data -----  (identical to the 2-stage humanml3d pipeline)
+data:
+  motion_dir: /home/jungbin_cho/HumanML3D/HumanML3D/kimodo_rep
+  text_dir: /home/jungbin_cho/HumanML3D/HumanML3D/texts
+  split_file: /home/jungbin_cho/HumanML3D/HumanML3D/train.txt
+  mean_path: /home/jungbin_cho/HumanML3D/HumanML3D/Mean_kimodo.npy
+  std_path: /home/jungbin_cho/HumanML3D/HumanML3D/Std_kimodo.npy
+  fps: 20
+  window_size: 200
+  max_motion_length: 200
+  min_motion_len: 40
+  unit_length: 4
+  random_heading_aug: true
+  num_workers: 8
+  pin_memory: true
+
+# ----- model -----
+model_config_path: /home/jungbin_cho/kimodo/configs/model/kimodo_3stage_humanml3d_small.yaml
+stats_path: /home/jungbin_cho/HumanML3D/HumanML3D/stats_kimodo
+denoiser_fps_override: 20
+# Optional warm-starts. Leave null to train from scratch.
+init_motion_denoiser_safetensors: null     # warm-start the Stage 3 denoiser (recommended)
+init_mask_generator_safetensors: null
+init_constraint_generator_safetensors: null
+
+# ----- text encoder (frozen LLM2Vec) -----
+text_encoder:
+  type: llm2vec
+  device: auto
+  fp32: false
+
+# ----- training loop -----
+trainer:
+  output_dir: ${output_dir}
+  batch_size: 32        # smaller default — three transformers in memory
+  grad_accum: 1
+  num_steps: 500000
+  lr: 2.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  warmup_steps: 1000
+  log_every: 50
+  ckpt_every: 5000
+  viz_every: 5000
+  text_drop_prob: 0.1
+  mask_drop_prob: 0.1   # mirror text-CFG drop for the mask: with this prob,
+                        # zero out (mask, observed_motion) so Stage 3 keeps
+                        # working with no constraints (text-only mode).
+  ema_decay: 0.995
+  ema_every: 10
+  mixed_precision: bf16
+  grad_clip: 1.0
+  resume_from: null
+  seed: 0
+
+  # Stage 3 / motion-denoiser loss weights (existing kimodo γ_1..γ_7).
+  loss_weights:
+    smooth_root_pos: 10.0
+    global_root_heading: 2.0
+    local_joints_positions: 10.0
+    velocities: 3.0
+    global_rot_data: 10.0
+    foot_contacts: 4.0
+    fk: 5.0
+  smooth_l1_beta: 1.0
+
+  # 3-stage-specific loss weights.
+  w_motion: 1.0          # weight on Stage 3 motion loss (the only "GT" loss)
+  w_stage2_aux: 1.0      # smooth_L1(values, GT_motion) — dense aux signal for Stage 2.
+                         # Mask is NOT used in this loss, so it leaks no GT-mask info.
+  w_sparsity: 5.0        # mean(mask_probs) regulariser — prevents mask=1 collapse
+  sparsity_target: 0.05  # if > 0, use a hinge: max(0, mean_mask - target) (so the
+                         # model is free to use up to this fraction of slots)
+
+# ----- visualization -----
+viz:
+  num_samples: 2
+  prompts:
+    - "a person is walking forward."
+    - "a person is jumping in place."
+  num_frames: 100
+  num_denoising_steps: 50
+  cfg_weight: [2.0, 0.0]
+  mask_threshold: null     # null = soft sigmoid mask; 0.5 = threshold to binary
+
+output_dir: /weka/jungbin/kimodo_runs/hml3d_3stage_v1
