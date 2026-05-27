@@ -378,6 +378,7 @@ def main() -> None:
 
     grad_accum = int(cfg.trainer.grad_accum)
     log_every = int(cfg.trainer.log_every)
+    print_every = int(cfg.trainer.get("print_every", 1))
     ckpt_every = int(cfg.trainer.ckpt_every)
     viz_every = int(cfg.trainer.viz_every)
     grad_clip = float(cfg.trainer.grad_clip)
@@ -425,6 +426,17 @@ def main() -> None:
 
             step += 1
             step_dt = time.time() - step_t0
+
+            if env.is_main and print_every > 0 and step % print_every == 0:
+                comp_print = " ".join(
+                    f"{k.replace('l_', '')}={v:.4f}"
+                    for k, v in agg_loss.items() if k.startswith("l_")
+                )
+                print(
+                    f"[step {step:>7d}] loss={agg_loss['loss']:.4f}"
+                    + (f" | {comp_print}" if comp_print else ""),
+                    flush=True,
+                )
 
             if env.is_main and step % log_every == 0:
                 lr_now = optimizer.param_groups[0]["lr"]
