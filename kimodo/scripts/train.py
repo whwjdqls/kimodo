@@ -155,14 +155,45 @@ class KimodoLoss(nn.Module):
         motion_rep,
         weights: Dict[str, float],
         smooth_l1_beta: float = 1.0,
-        fk_target: str = "gt",  # "gt": match GT positions; "pred": match pred positions block
+        fk_target: str = "gt",
+        # fk_target values:
+        #   "gt"     -> compare FK(pred_rot) against the GT positions block.
+        #               Paper-faithful but assumes the FK calibration (skeleton bone
+        #               offsets) matches the data — true for SOMA/SMPL fixed skeletons
+        #               but NOT for HumanML3D which uses per-actor bone lengths.
+        #   "pred"   -> compare FK(pred_rot) against the predicted positions block.
+        #               Self-consistency only (no GT supervision).
+        #   "fk_gt"  -> compare FK(pred_rot) against FK(gt_rot) under the SAME
+        #               canonical skeleton. The constant per-actor calibration error
+        #               cancels on both sides, leaving a pure rotational-consistency
+        #               loss. Use this with ``fk_kind="chainreset_hml3d"``.
+        fk_kind: str = "standard",  # 'standard' (skeleton.fk) | 'chainreset_hml3d'
+        fk_neutral_joints: Optional[torch.Tensor] = None,
+        fk_chains: Optional[List[List[int]]] = None,
     ):
         super().__init__()
         self.motion_rep = motion_rep
         self.weights = dict(weights)
         self.smooth_l1_beta = float(smooth_l1_beta)
-        assert fk_target in ("gt", "pred")
+        assert fk_target in ("gt", "pred", "fk_gt")
         self.fk_target = fk_target
+        assert fk_kind in ("standard", "chainreset_hml3d")
+        self.fk_kind = fk_kind
+        if fk_kind == "chainreset_hml3d":
+            from kimodo.motion_rep.fk_hml3d import (
+                HML3D_KINEMATIC_CHAIN,
+                HML3D_RAW_OFFSETS,
+            )
+            self.fk_chains = [list(c) for c in (fk_chains or HML3D_KINEMATIC_CHAIN)]
+            # Register HumanML3D's axis-aligned unit offsets as a buffer so the
+            # FK runs on the model's device. NOTE: ``fk_neutral_joints`` is no
+            # longer used — HumanML3D's FK requires raw axis offsets multiplied
+            # by per-sample bone lengths, not the canonical T-pose bone vectors.
+            self.register_buffer(
+                "fk_raw_offsets", HML3D_RAW_OFFSETS.clone().float(), persistent=False,
+            )
+        else:
+            self.fk_chains = None
 
     def _smooth_l1(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # element-wise smooth-L1 (no reduction); we apply our own pad-mask average.
@@ -170,55 +201,103 @@ class KimodoLoss(nn.Module):
             pred, target, reduction="none", beta=self.smooth_l1_beta,
         )
 
+    def _fk_world_from_pred(
+        self, pred_un: torch.Tensor,
+        bone_lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute (B, T, J, 3) world joint positions from unnormalized predictions.
+
+        Branches on ``self.fk_kind``:
+          - ``"standard"``: predicted 6D rotations interpreted as global
+            rotations under parent-relative semantics; we convert to local
+            rotations then run ``motion_rep.skeleton.fk``.
+          - ``"chainreset_hml3d"``: predicted 6D rotations interpreted as
+            HumanML3D chain-reset global rotations; we walk the kinematic
+            chains and accumulate bone vectors of length ``bone_lengths[j]``
+            in HumanML3D's canonical ``raw_offset`` direction. ``bone_lengths``
+            must be supplied (typically derived from the GT batch).
+        """
+        from kimodo.geometry import cont6d_to_matrix
+
+        mr = self.motion_rep
+        pred_rot_data = pred_un[..., mr.slice_dict["global_rot_data"]]
+        pred_rot_data = pred_rot_data.reshape(*pred_rot_data.shape[:2], mr.nbjoints, 6)
+        pred_global_rot = cont6d_to_matrix(pred_rot_data)  # (B, T, J, 3, 3)
+        pred_smooth_root = pred_un[..., mr.slice_dict["smooth_root_pos"]]  # (B, T, 3)
+
+        if self.fk_kind == "standard":
+            from kimodo.skeleton.transforms import global_rots_to_local_rots
+            pred_local_rot = global_rots_to_local_rots(pred_global_rot, mr.skeleton)
+            _, pred_posed, _ = mr.skeleton.fk(pred_local_rot, pred_smooth_root)
+            return pred_posed
+        elif self.fk_kind == "chainreset_hml3d":
+            if bone_lengths is None:
+                raise ValueError(
+                    "fk_kind='chainreset_hml3d' requires bone_lengths (derived per-sample from GT)"
+                )
+            from kimodo.motion_rep.fk_hml3d import chainreset_fk_world_joints
+            return chainreset_fk_world_joints(
+                pred_global_rot,
+                pred_smooth_root,
+                bone_lengths=bone_lengths,
+                raw_offsets=self.fk_raw_offsets,
+                chains=self.fk_chains,
+            )
+        else:
+            raise ValueError(f"unknown fk_kind: {self.fk_kind}")
+
     def _fk_term(
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
         pad_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """gamma_7: ||FK(predicted rotations) - GT joint positions||_1
+        """gamma_7: ||FK(predicted rotations) - target joint positions||_1.
 
-        Both pred and target are normalized features. We unnormalize the slices
-        we need locally so we don't mutate the inputs.
+        ``fk_target='gt'`` compares against the GT positions block (paper),
+        ``fk_target='pred'`` against the predicted positions block (pure
+        self-consistency). Both pred and target are *normalized* features
+        when this is called; we unnormalize locally without mutating inputs.
         """
-        from kimodo.skeleton.transforms import global_rots_to_local_rots
-        from kimodo.geometry import cont6d_to_matrix
-
         mr = self.motion_rep
         pred_un = mr.unnormalize(pred)
-        # predicted global 6D rotations -> local rotation matrices
-        pred_rot_data = pred_un[..., mr.slice_dict["global_rot_data"]]
-        pred_rot_data = pred_rot_data.reshape(*pred_rot_data.shape[:2], mr.nbjoints, 6)
-        pred_global_rot = cont6d_to_matrix(pred_rot_data)
-        pred_local_rot = global_rots_to_local_rots(pred_global_rot, mr.skeleton)
-
-        # Root positions to use as FK origin. Use the predicted smooth_root_pos so
-        # the FK output sits in the predicted world frame.
-        pred_smooth_root = pred_un[..., mr.slice_dict["smooth_root_pos"]]
-        # smooth_root_pos has the planar component; recover the actual root xyz
-        # from local_joints_positions if needed. Use smooth_root_pos directly
-        # (consistent with motion_rep.inverse default behavior).
-        _, pred_posed, _ = mr.skeleton.fk(pred_local_rot, pred_smooth_root)
-
-        # Target joints in world space — read from the GT features.
         target_un = mr.unnormalize(target)
-        if self.fk_target == "gt":
-            tgt_smooth_root = target_un[..., mr.slice_dict["smooth_root_pos"]]
-            tgt_local_jp = target_un[..., mr.slice_dict["local_joints_positions"]]
-            tgt_local_jp = tgt_local_jp.reshape(*tgt_local_jp.shape[:2], mr.nbjoints, 3)
-            # local_joints_positions has the per-joint offsets in pelvis-relative
-            # frame with the hips xz-offset added; recovering world positions:
-            tgt_world = tgt_local_jp.clone()
-            tgt_world[..., 0] += tgt_smooth_root[..., None, 0]
-            tgt_world[..., 2] += tgt_smooth_root[..., None, 2]
+
+        # For chain-reset FK we need per-sample bone lengths. Derive them from
+        # GT world joint positions (the GT data itself encodes each actor's
+        # bone proportions). Use no_grad so this is purely a constant on the
+        # forward pass — gradient still flows through pred_global_rot.
+        bone_lengths: Optional[torch.Tensor] = None
+        if self.fk_kind == "chainreset_hml3d":
+            from kimodo.motion_rep.fk_hml3d import (
+                derive_bone_lengths_from_world_joints,
+                world_joints_from_kimodo_features,
+            )
+            with torch.no_grad():
+                gt_world = world_joints_from_kimodo_features(
+                    target_un, mr.slice_dict, n_joints=mr.nbjoints,
+                )  # (B, T, J, 3)
+                bone_lengths = derive_bone_lengths_from_world_joints(gt_world)
+
+        pred_posed = self._fk_world_from_pred(pred_un, bone_lengths=bone_lengths)
+
+        if self.fk_target == "fk_gt":
+            # Pure rotational-consistency target: run FK on the GT rotations
+            # through the SAME skeleton (same bone_lengths) so any per-sample
+            # calibration cancels and the loss measures only rotational + root
+            # errors.
+            with torch.no_grad():
+                tgt_world = self._fk_world_from_pred(target_un, bone_lengths=bone_lengths)
         else:
-            # "pred": compare to predicted positions instead of GT
-            pred_smooth_root_p = pred_un[..., mr.slice_dict["smooth_root_pos"]]
-            pred_local_jp = pred_un[..., mr.slice_dict["local_joints_positions"]]
-            pred_local_jp = pred_local_jp.reshape(*pred_local_jp.shape[:2], mr.nbjoints, 3)
-            tgt_world = pred_local_jp.clone()
-            tgt_world[..., 0] += pred_smooth_root_p[..., None, 0]
-            tgt_world[..., 2] += pred_smooth_root_p[..., None, 2]
+            # Read positions block of GT (paper) or of the predicted features (pure self-consistency).
+            src_un = target_un if self.fk_target == "gt" else pred_un
+            src_smooth_root = src_un[..., mr.slice_dict["smooth_root_pos"]]
+            src_local_jp = src_un[..., mr.slice_dict["local_joints_positions"]]
+            src_local_jp = src_local_jp.reshape(*src_local_jp.shape[:2], mr.nbjoints, 3)
+            tgt_world = src_local_jp.clone()
+            # local_joints_positions stores world XYZ minus (smooth_root_x, 0, smooth_root_z).
+            tgt_world[..., 0] = tgt_world[..., 0] + src_smooth_root[..., None, 0]
+            tgt_world[..., 2] = tgt_world[..., 2] + src_smooth_root[..., None, 2]
 
         diff = (pred_posed - tgt_world).abs()  # (B, T, J, 3)
         mask = pad_mask.float().unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)

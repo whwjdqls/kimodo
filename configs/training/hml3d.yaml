@@ -63,7 +63,7 @@ trainer:
     velocities: 3.0             # γ₄
     global_rot_data: 10.0       # γ₅
     foot_contacts: 4.0          # γ₆
-    fk: 0.0                     # γ₇ DISABLED: chain-reset FK mismatch with skeleton.fk
+    fk: 5.0                     # γ₇ ENABLED via chain-reset FK (HumanML3D convention)
   smooth_l1_beta: 1.0
   phase: text
 

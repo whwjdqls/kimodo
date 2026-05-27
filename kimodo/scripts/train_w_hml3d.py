@@ -323,19 +323,22 @@ def main() -> None:
         denoiser = DDP(denoiser, device_ids=[env.local_rank], find_unused_parameters=False)
 
     # ----- loss -----
-    # For HumanML3D, γ₇ MUST be 0 (chain-reset FK mismatch). Enforce here.
+    # For HumanML3D, γ₇ is computed with the **chain-reset** FK to match the
+    # data's rotation convention. Running the standard parent-relative FK on
+    # these rotations would give wrong joint positions, so we dispatch to the
+    # chain-reset variant here. The skeleton's neutral_joints (SMPLXSkeleton22
+    # T-pose) and HumanML3D's t2m_kinematic_chain provide the bone offsets.
     weights = dict(cfg.trainer.loss_weights)
-    if float(weights.get("fk", 0.0)) != 0.0:
-        log.warning(
-            "loss_weights.fk=%s is forced to 0.0 for HumanML3D training (chain-reset FK mismatch).",
-            weights.get("fk"),
-        )
-        weights["fk"] = 0.0
     loss_fn = KimodoLoss(
         motion_rep,
         weights,
         smooth_l1_beta=float(cfg.trainer.get("smooth_l1_beta", 1.0)),
-    )
+        fk_kind="chainreset_hml3d",
+        # Paper-faithful: compare FK(pred_rot, GT_bone_lengths) against the GT
+        # positions block. With the corrected raw_offsets-based FK, this is a
+        # physically meaningful per-meter error in the actor's actual skeleton.
+        fk_target="gt",
+    ).to(device)
 
     # Phase 2 (constraints) is supported by ConstraintSampler but disabled by
     # default here. Reuse the SOMA pipeline's sampler if needed.
