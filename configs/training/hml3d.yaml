@@ -1,0 +1,80 @@
+# Training config: KIMODO-style text-to-motion on HumanML3D-in-Kimodo features.
+#
+# Reads the precomputed (T, 273) kimodo features from {motion_dir}/{id}.npz,
+# pairs each motion with its HumanML3D text captions (and sub-segment
+# captions), and trains the small MDM-base-sized denoiser defined in
+# configs/model/kimodo_humanml3d_small.yaml.
+#
+# NOTE: γ₇ (FK consistency) is OFF for HumanML3D — see the dataset docstring.
+
+# ----- data -----
+data:
+  motion_dir: /home/jungbin_cho/HumanML3D/HumanML3D/kimodo_rep
+  text_dir: /home/jungbin_cho/HumanML3D/HumanML3D/texts
+  split_file: /home/jungbin_cho/HumanML3D/HumanML3D/train.txt
+  mean_path: /home/jungbin_cho/HumanML3D/HumanML3D/Mean_kimodo.npy
+  std_path: /home/jungbin_cho/HumanML3D/HumanML3D/Std_kimodo.npy
+  fps: 20
+  window_size: 200          # random window length cap (frames). Paper = 10s @ 20fps.
+  max_motion_length: 200    # pad outputs to this fixed length
+  min_motion_len: 40        # match momask HumanML3D default
+  unit_length: 4            # window length rounded to multiple of this
+  random_heading_aug: true
+  num_workers: 8
+  pin_memory: true
+
+# ----- model -----
+model_config_path: /home/jungbin_cho/kimodo/configs/model/kimodo_humanml3d_small.yaml
+stats_path: /home/jungbin_cho/HumanML3D/HumanML3D/stats_kimodo
+denoiser_fps_override: 20
+init_from_safetensors: null
+
+# ----- text encoder (frozen LLM2Vec, same as the SOMA pipeline) -----
+text_encoder:
+  type: llm2vec
+  device: auto
+  fp32: false
+
+# ----- training loop -----
+trainer:
+  output_dir: ${output_dir}
+  batch_size: 64
+  grad_accum: 1
+  num_steps: 500000
+  lr: 2.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  warmup_steps: 1000
+  log_every: 50
+  ckpt_every: 5000
+  viz_every: 5000
+  eval_every: 0
+  text_drop_prob: 0.1
+  ema_decay: 0.995
+  ema_every: 10
+  mixed_precision: bf16
+  grad_clip: 1.0
+  resume_from: null
+  seed: 0
+  loss_weights:
+    smooth_root_pos: 10.0       # γ₁
+    global_root_heading: 2.0    # γ₂
+    local_joints_positions: 10.0 # γ₃
+    velocities: 3.0             # γ₄
+    global_rot_data: 10.0       # γ₅
+    foot_contacts: 4.0          # γ₆
+    fk: 0.0                     # γ₇ DISABLED: chain-reset FK mismatch with skeleton.fk
+  smooth_l1_beta: 1.0
+  phase: text
+
+# ----- visualization -----
+viz:
+  num_samples: 2
+  prompts:
+    - "a person is walking forward."
+    - "a person is jumping in place."
+  num_frames: 100
+  num_denoising_steps: 50
+  cfg_weight: [2.0, 0.0]
+
+output_dir: /weka/jungbin/kimodo_runs/hml3d_small_v1
