@@ -44,7 +44,7 @@ from kimodo.skeleton import SOMASkeleton30
 
 log = logging.getLogger(__name__)
 
-
+# this is debug
 @dataclass
 class SegmentEntry:
     motion_path: str
