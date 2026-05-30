@@ -16,6 +16,7 @@ data:
   min_motion_len: 40
   unit_length: 4
   random_heading_aug: true
+  clip_normalized: null     # clamp normalized features to +/- this (null = off). Try 15.0.
   num_workers: 8
   pin_memory: true
 

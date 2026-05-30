@@ -547,6 +547,25 @@ class ConstraintSampler:
 
 
 # -----------------------------------------------------------------------------
+# Diffusion schedule helper
+# -----------------------------------------------------------------------------
+def ensure_full_training_schedule(diffusion: Diffusion) -> None:
+    """Reset the diffusion buffers to the full ``num_base_steps`` schedule.
+
+    DDIM sampling (used in viz / inference) calls ``calc_diffusion_vars`` with a
+    subsampled timestep set, mutating the schedule buffers in place. Training's
+    ``q_sample`` must use the full contiguous schedule, so we restore it here.
+    The full ``use_timesteps`` (an ``arange``) is cached on the diffusion object
+    to avoid recomputing it every step.
+    """
+    cached = getattr(diffusion, "_full_use_timesteps", None)
+    if cached is None or cached.device != diffusion.device:
+        cached = diffusion.space_timesteps(diffusion.num_base_steps)[0]
+        diffusion._full_use_timesteps = cached
+    diffusion.calc_diffusion_vars(cached)
+
+
+# -----------------------------------------------------------------------------
 # Train step
 # -----------------------------------------------------------------------------
 def train_one_step(
@@ -579,10 +598,19 @@ def train_one_step(
 
     text_pad_mask = torch.ones(text_feat.shape[:2], dtype=torch.bool, device=device)
 
+    # IMPORTANT: restore the FULL training diffusion schedule before q_sample.
+    # Sampling/viz calls ``diffusion.calc_diffusion_vars(spaced_timesteps)`` which
+    # mutates the schedule buffers (sqrt_alphas_cumprod, ...) IN PLACE for a
+    # subsampled (e.g. 50-step) DDIM schedule. If we don't reset them here, the
+    # next training step's q_sample indexes those subsampled buffers with the
+    # contiguous timestep t in [0, num_base_steps) and adds a wrong amount of
+    # noise — which permanently destabilizes training right after the first viz.
+    ensure_full_training_schedule(diffusion)
+
     # Sample diffusion timesteps uniformly.
     t = torch.randint(0, diffusion.num_base_steps, (B,), device=device)
 
-    # q_sample (forward diffusion). We pre-cache the full schedule (already done in __init__).
+    # q_sample (forward diffusion) — now guaranteed to use the full schedule.
     noise = torch.randn_like(motion)
     motion_t = diffusion.q_sample(motion, t, noise=noise)
 
@@ -616,6 +644,10 @@ def train_one_step(
         # Cast to float32 for loss computation (stability with bf16 forward).
         pred_clean = pred_clean.float()
         losses = loss_fn(pred_clean, motion, pad_mask)
+    # Cheap data-sanity signals for spotting representation/normalization issues.
+    # (Logged to TB; a healthy normalized batch is usually within ~[-5, 5].)
+    losses["data_absmax"] = motion.detach().abs().max()
+    losses["timestep_mean"] = t.float().mean()
     return losses
 
 
@@ -1000,11 +1032,13 @@ def main() -> None:
 
             if scaler is not None:
                 scaler.unscale_(optimizer)
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    denoiser.parameters() if not hasattr(denoiser, "module") else denoiser.module.parameters(),
-                    grad_clip,
-                )
+            params_for_clip = (
+                denoiser.parameters() if not hasattr(denoiser, "module") else denoiser.module.parameters()
+            )
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                params_for_clip, grad_clip if grad_clip > 0 else float("inf"),
+            )
+            agg_loss["grad_norm"] = float(grad_norm)
             if scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
@@ -1022,6 +1056,7 @@ def main() -> None:
                 lr_now = optimizer.param_groups[0]["lr"]
                 line = (
                     f"step={step} loss={agg_loss['loss']:.4f} "
+                    f"grad_norm={agg_loss.get('grad_norm', 0.0):.2f} "
                     f"lr={lr_now:.2e} dt={step_dt:.2f}s"
                 )
                 comp = " ".join(f"{k.replace('l_',''):s}={v:.3f}" for k, v in agg_loss.items() if k.startswith("l_"))
@@ -1033,6 +1068,11 @@ def main() -> None:
                         tb_writer.add_scalar(f"train/{k}", v, step)
                     tb_writer.add_scalar("train/lr", lr_now, step)
                     tb_writer.add_scalar("train/step_time", step_dt, step)
+                    if torch.cuda.is_available():
+                        dev_idx = device.index if device.index is not None else 0
+                        tb_writer.add_scalar("gpu/mem_allocated_GB", torch.cuda.max_memory_allocated(dev_idx) / 1e9, step)
+                        tb_writer.add_scalar("gpu/mem_reserved_GB", torch.cuda.max_memory_reserved(dev_idx) / 1e9, step)
+                        torch.cuda.reset_peak_memory_stats(dev_idx)
 
             if env.is_main and ckpt_every and step % ckpt_every == 0:
                 save_checkpoint(

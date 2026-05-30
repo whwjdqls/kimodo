@@ -1,5 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Train a KIMODO-style text-to-motion model on HumanML3D (in Kimodo features).
 
 This is the HumanML3D counterpart to ``kimodo.scripts.train``. Everything
@@ -153,6 +151,192 @@ def viz_generate_samples_hml3d(
 
 
 # -----------------------------------------------------------------------------
+# Test-set side-by-side visualization (generated vs GT)
+# -----------------------------------------------------------------------------
+def _load_test_examples(
+    motion_dir: str,
+    text_dir: str,
+    split_file: str,
+    n_samples: int,
+    max_frames: int,
+    min_frames: int = 40,
+):
+    """Load a fixed set of test examples for side-by-side viz.
+
+    Returns a list of dicts: ``{id, caption, gt_features (T,273) unnormalized, length}``.
+    Picks the first ``n_samples`` ids present on disk, takes the first
+    (full-motion) caption, and uses the first ``max_frames`` frames (no random
+    window / no heading aug — we want a deterministic, comparable clip).
+    """
+    import codecs as cs
+    from pathlib import Path as _Path
+
+    motion_dir = _Path(motion_dir)
+    text_dir = _Path(text_dir)
+    with open(split_file, "r") as f:
+        ids = [ln.strip() for ln in f if ln.strip()]
+
+    out = []
+    for mid in ids:
+        if len(out) >= n_samples:
+            break
+        mp = motion_dir / f"{mid}.npz"
+        tp = text_dir / f"{mid}.txt"
+        if not mp.is_file() or not tp.is_file():
+            continue
+        try:
+            with np.load(mp) as z:
+                if "features" not in z.files:
+                    continue
+                feats = np.asarray(z["features"]).astype(np.float32)
+        except Exception:
+            continue
+        if feats.shape[1] != 273 or feats.shape[0] < min_frames:
+            continue
+        # First full-motion caption (f_tag == to_tag == 0).
+        caption = None
+        with cs.open(tp, "r") as tf:
+            for line in tf.readlines():
+                parts = line.strip().split("#")
+                if len(parts) < 4:
+                    continue
+                try:
+                    f_tag, to_tag = float(parts[2]), float(parts[3])
+                except Exception:
+                    continue
+                if f_tag == 0.0 and to_tag == 0.0:
+                    caption = parts[0]
+                    break
+        if caption is None:
+            continue
+        T = min(feats.shape[0], max_frames)
+        out.append({"id": mid, "caption": caption, "gt_features": feats[:T], "length": int(T)})
+    return out
+
+
+@torch.no_grad()
+def viz_test_vs_gt(
+    denoiser: nn.Module,
+    diffusion: Diffusion,
+    text_encoder,
+    device: torch.device,
+    cfg: DictConfig,
+    step: int,
+    out_dir: Path,
+    mean: np.ndarray,
+    std: np.ndarray,
+    test_examples: list,
+    tb_writer=None,
+) -> None:
+    """Generate motion for held-out test captions and render side-by-side with GT.
+
+    Writes one MP4 per example to ``out_dir`` and (if a TensorBoard writer is
+    given) logs a stacked video under ``viz/test_vs_gt``.
+    """
+    import imageio.v3 as iio
+
+    from kimodo.motion_rep.fk_hml3d import world_joints_from_kimodo_features
+    from kimodo.scripts.render_hml3d import render_sidebyside
+
+    if not test_examples:
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw = (denoiser.module if hasattr(denoiser, "module") else denoiser).eval()
+    motion_rep = raw.motion_rep
+    n_steps = int(cfg.viz.num_denoising_steps)
+    fps = int(cfg.data.get("fps", 20))
+    mean_t = torch.from_numpy(mean).to(device)
+    std_t = torch.from_numpy(std).to(device)
+
+    # Batch all examples to a common padded length for one diffusion pass.
+    lengths = [ex["length"] for ex in test_examples]
+    captions = [ex["caption"] for ex in test_examples]
+    max_T = int(max(lengths))
+    B = len(test_examples)
+
+    text_feat = encode_texts(text_encoder, captions, device)
+    text_pad_mask = torch.ones(text_feat.shape[:2], dtype=torch.bool, device=device)
+    pad_mask = torch.zeros(B, max_T, dtype=torch.bool, device=device)
+    for i, L in enumerate(lengths):
+        pad_mask[i, :L] = True
+    first_heading = torch.zeros(B, device=device)
+    motion_mask = torch.zeros(B, max_T, motion_rep.motion_rep_dim, device=device)
+    observed = torch.zeros(B, max_T, motion_rep.motion_rep_dim, device=device)
+
+    use_timesteps, map_tensor = diffusion.space_timesteps(n_steps)
+    diffusion.calc_diffusion_vars(use_timesteps)
+    cur = torch.randn(B, max_T, motion_rep.motion_rep_dim, device=device)
+    for i in list(range(n_steps))[::-1]:
+        t = torch.full((B,), i, device=device, dtype=torch.long)
+        t_map = map_tensor[t]
+        pred_clean = raw(
+            cur, pad_mask, text_feat, text_pad_mask, t_map,
+            first_heading_angle=first_heading,
+            motion_mask=motion_mask, observed_motion=observed,
+        )
+        eps = (
+            diffusion.sqrt_recip_alphas_cumprod[t, None, None] * cur - pred_clean
+        ) / diffusion.sqrt_recipm1_alphas_cumprod[t, None, None]
+        alpha_bar_prev = diffusion.alphas_cumprod_prev[t, None, None]
+        cur = pred_clean * alpha_bar_prev.sqrt() + (1 - alpha_bar_prev).sqrt() * eps
+    raw.train()
+
+    gen_unnorm = cur.float() * std_t + mean_t  # (B, max_T, 273), normalized -> raw
+
+    video_stack = []  # for tensorboard: list of (T, H, W, 3)
+    for i, ex in enumerate(test_examples):
+        L = ex["length"]
+        gen_feats = gen_unnorm[i, :L].unsqueeze(0)  # (1, L, 273)
+        gt_feats = torch.from_numpy(ex["gt_features"]).to(device).unsqueeze(0)  # already unnormalized
+
+        gen_joints = world_joints_from_kimodo_features(
+            gen_feats, motion_rep.slice_dict, n_joints=motion_rep.nbjoints,
+        )[0].cpu().numpy()
+        gt_joints = world_joints_from_kimodo_features(
+            gt_feats, motion_rep.slice_dict, n_joints=motion_rep.nbjoints,
+        )[0].cpu().numpy()
+
+        frames = render_sidebyside(gt_joints, gen_joints, caption=ex["caption"])  # (Tr, H, W, 3)
+        mp4_path = out_dir / f"step{step:07d}_{ex['id']}_gt_vs_gen.mp4"
+        try:
+            iio.imwrite(str(mp4_path), frames, fps=float(fps), codec="h264", plugin="pyav")
+        except Exception as e:
+            log.warning("MP4 write failed for %s (%s); skipping file.", ex["id"], e)
+        video_stack.append(frames)
+
+    if tb_writer is not None and video_stack:
+        # add_video wants (N, T, C, H, W) in [0,1]. Pad to common T.
+        Tmax = max(v.shape[0] for v in video_stack)
+        H, W = video_stack[0].shape[1:3]
+        vids = np.zeros((len(video_stack), Tmax, 3, H, W), dtype=np.float32)
+        for n, v in enumerate(video_stack):
+            vt = np.transpose(v, (0, 3, 1, 2)).astype(np.float32) / 255.0  # (T, C, H, W)
+            vids[n, : vt.shape[0]] = vt
+            if vt.shape[0] < Tmax:  # freeze last frame for padding
+                vids[n, vt.shape[0]:] = vt[-1]
+        video_ok = False
+        try:
+            tb_writer.add_video("viz/test_vs_gt", torch.from_numpy(vids), global_step=step, fps=fps)
+            video_ok = True
+        except Exception as e:
+            log.warning("TensorBoard add_video failed (%s); logging frame strips instead.", e)
+        if not video_ok:
+            # Fallback: log a horizontal strip of ~5 evenly-spaced frames per sample.
+            for n, v in enumerate(video_stack):
+                k = min(5, v.shape[0])
+                sel = np.linspace(0, v.shape[0] - 1, k, dtype=int)
+                strip = np.concatenate([v[s] for s in sel], axis=1)  # (H, k*W, 3)
+                tb_writer.add_image(
+                    f"viz/test_vs_gt/{test_examples[n]['id']}",
+                    torch.from_numpy(strip).permute(2, 0, 1),  # (3, H, kW)
+                    global_step=step,
+                )
+
+    log.info("Wrote %d test-vs-GT side-by-side videos to %s", len(test_examples), out_dir)
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
@@ -241,6 +425,7 @@ def main() -> None:
             min_motion_len=int(cfg.data.min_motion_len),
             unit_length=int(cfg.data.unit_length),
             random_heading_aug=bool(cfg.data.random_heading_aug),
+            clip_normalized=cfg.data.get("clip_normalized"),
             skeleton=dataset_motion_rep.skeleton,
             motion_rep=dataset_motion_rep,
             seed=seed,
@@ -373,6 +558,22 @@ def main() -> None:
         except Exception as e:
             log.warning("TensorBoard not available: %s", e)
 
+    # ----- held-out test examples for side-by-side viz (rank 0 only) -----
+    test_examples = []
+    if env.is_main and bool(cfg.viz.get("test_vs_gt", True)):
+        try:
+            test_examples = _load_test_examples(
+                motion_dir=cfg.data.motion_dir,
+                text_dir=cfg.data.text_dir,
+                split_file=cfg.viz.get("test_split_file", cfg.data.split_file),
+                n_samples=int(cfg.viz.get("num_test_samples", 4)),
+                max_frames=int(cfg.viz.get("test_max_frames", cfg.data.max_motion_length)),
+                min_frames=int(cfg.data.get("min_motion_len", 40)),
+            )
+            log.info("Loaded %d held-out test examples for side-by-side viz.", len(test_examples))
+        except Exception as e:
+            log.warning("Could not load test examples for viz: %s", e)
+
     log.info("Starting training from step %d for %d steps", start_step, num_steps)
     denoiser.train()
 
@@ -409,11 +610,17 @@ def main() -> None:
 
             if scaler is not None:
                 scaler.unscale_(optimizer)
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    denoiser.parameters() if not hasattr(denoiser, "module") else denoiser.module.parameters(),
-                    grad_clip,
-                )
+            params_for_clip = (
+                denoiser.parameters() if not hasattr(denoiser, "module") else denoiser.module.parameters()
+            )
+            # Always compute the total grad norm for logging. When grad_clip>0,
+            # clip_grad_norm_ both clips and returns the pre-clip norm; otherwise
+            # compute it with max_norm=inf (no clipping).
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                params_for_clip, grad_clip if grad_clip > 0 else float("inf"),
+            )
+            grad_norm_val = float(grad_norm)
+            agg_loss["grad_norm"] = grad_norm_val
             if scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
@@ -442,6 +649,7 @@ def main() -> None:
                 lr_now = optimizer.param_groups[0]["lr"]
                 line = (
                     f"step={step} loss={agg_loss['loss']:.4f} "
+                    f"grad_norm={agg_loss.get('grad_norm', 0.0):.2f} "
                     f"lr={lr_now:.2e} dt={step_dt:.2f}s"
                 )
                 comp = " ".join(
@@ -456,6 +664,20 @@ def main() -> None:
                         tb_writer.add_scalar(f"train/{k}", v, step)
                     tb_writer.add_scalar("train/lr", lr_now, step)
                     tb_writer.add_scalar("train/step_time", step_dt, step)
+                    # GPU memory (peak since last reset), in GB.
+                    if torch.cuda.is_available():
+                        dev_idx = device.index if device.index is not None else 0
+                        tb_writer.add_scalar(
+                            "gpu/mem_allocated_GB",
+                            torch.cuda.max_memory_allocated(dev_idx) / 1e9, step,
+                        )
+                        tb_writer.add_scalar(
+                            "gpu/mem_reserved_GB",
+                            torch.cuda.max_memory_reserved(dev_idx) / 1e9, step,
+                        )
+                        free_b, total_b = torch.cuda.mem_get_info(dev_idx)
+                        tb_writer.add_scalar("gpu/mem_used_GB", (total_b - free_b) / 1e9, step)
+                        torch.cuda.reset_peak_memory_stats(dev_idx)
 
             if env.is_main and ckpt_every and step % ckpt_every == 0:
                 save_checkpoint(
@@ -478,6 +700,15 @@ def main() -> None:
                     )
                 except Exception as e:
                     log.warning("Viz failed at step %d: %s", step, e)
+                if test_examples:
+                    try:
+                        viz_test_vs_gt(
+                            denoiser, diffusion, text_encoder, device, cfg, step,
+                            output_dir / "viz_test_vs_gt", mean=mean, std=std,
+                            test_examples=test_examples, tb_writer=tb_writer,
+                        )
+                    except Exception as e:
+                        log.warning("Test-vs-GT viz failed at step %d: %s", step, e)
 
             if step >= num_steps:
                 break

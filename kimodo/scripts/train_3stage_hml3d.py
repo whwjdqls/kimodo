@@ -82,6 +82,7 @@ from kimodo.scripts.train import (  # noqa: E402
     _NullCtx,
     build_text_encoder,
     encode_texts,
+    ensure_full_training_schedule,
     load_config,
     maybe_barrier,
     setup_distributed,
@@ -208,6 +209,8 @@ def train_one_step_3stage(
         observed_motion = mask_probs_used * values  # (B, T, D)
 
         # ----- Stage 3 (motion denoiser + diffusion) -----
+        # Restore the full training schedule (viz/sampling mutates it in place).
+        ensure_full_training_schedule(diffusion)
         t = torch.randint(0, diffusion.num_base_steps, (B,), device=device)
         noise = torch.randn_like(motion)
         motion_t = diffusion.q_sample(motion, t, noise=noise)
@@ -474,6 +477,7 @@ def main() -> None:
             min_motion_len=int(cfg.data.min_motion_len),
             unit_length=int(cfg.data.unit_length),
             random_heading_aug=bool(cfg.data.random_heading_aug),
+            clip_normalized=cfg.data.get("clip_normalized"),
             skeleton=dataset_motion_rep.skeleton,
             motion_rep=dataset_motion_rep,
             seed=seed,
@@ -625,11 +629,13 @@ def main() -> None:
 
             if scaler is not None:
                 scaler.unscale_(optimizer)
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    three_stage.parameters() if not hasattr(three_stage, "module") else three_stage.module.parameters(),
-                    grad_clip,
-                )
+            params_for_clip = (
+                three_stage.parameters() if not hasattr(three_stage, "module") else three_stage.module.parameters()
+            )
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                params_for_clip, grad_clip if grad_clip > 0 else float("inf"),
+            )
+            agg_loss["grad_norm"] = float(grad_norm)
             if scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
@@ -647,6 +653,7 @@ def main() -> None:
                 lr_now = optimizer.param_groups[0]["lr"]
                 line = (
                     f"step={step} loss={agg_loss['loss']:.4f} "
+                    f"grad_norm={agg_loss.get('grad_norm', 0.0):.2f} "
                     f"lr={lr_now:.2e} dt={step_dt:.2f}s | "
                     f"motion={agg_loss.get('l_motion_total',0):.3f} "
                     f"stage2_aux={agg_loss.get('l_stage2_aux',0):.3f} "
@@ -659,6 +666,11 @@ def main() -> None:
                         tb_writer.add_scalar(f"train/{k}", v, step)
                     tb_writer.add_scalar("train/lr", lr_now, step)
                     tb_writer.add_scalar("train/step_time", step_dt, step)
+                    if torch.cuda.is_available():
+                        dev_idx = device.index if device.index is not None else 0
+                        tb_writer.add_scalar("gpu/mem_allocated_GB", torch.cuda.max_memory_allocated(dev_idx) / 1e9, step)
+                        tb_writer.add_scalar("gpu/mem_reserved_GB", torch.cuda.max_memory_reserved(dev_idx) / 1e9, step)
+                        torch.cuda.reset_peak_memory_stats(dev_idx)
 
             if env.is_main and ckpt_every and step % ckpt_every == 0:
                 save_3stage_checkpoint(

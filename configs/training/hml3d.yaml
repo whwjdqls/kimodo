@@ -20,6 +20,11 @@ data:
   min_motion_len: 40        # match momask HumanML3D default
   unit_length: 4            # window length rounded to multiple of this
   random_heading_aug: true
+  # Optional: clamp normalized features to +/- this value. The kimodo HumanML3D
+  # stats are per-block-constant and the velocities block has a small std, so
+  # rare fast frames normalize to |x| ~ 65. Clamping caps their contribution to
+  # the x0 loss / gradients. null = off. Try 15.0 if velocities/fk loss spikes.
+  clip_normalized: null
   num_workers: 8
   pin_memory: true
 
@@ -76,5 +81,10 @@ viz:
   num_frames: 100
   num_denoising_steps: 50
   cfg_weight: [2.0, 0.0]
+  # Side-by-side generated-vs-GT rendering on held-out test motions.
+  test_vs_gt: true
+  test_split_file: /home/jungbin_cho/HumanML3D/HumanML3D/test.txt
+  num_test_samples: 4
+  test_max_frames: 196      # cap GT/generated length for the side-by-side video
 
 output_dir: /weka/jungbin/kimodo_runs/hml3d_small_v1

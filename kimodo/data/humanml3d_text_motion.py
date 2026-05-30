@@ -133,6 +133,7 @@ class HumanML3DTextMotionDataset(Dataset):
         min_motion_len: int = 40,
         unit_length: int = 4,
         random_heading_aug: bool = True,
+        clip_normalized: Optional[float] = None,
         skeleton: Optional[SMPLXSkeleton22] = None,
         motion_rep: Optional[KimodoMotionRep] = None,
         seed: Optional[int] = None,
@@ -147,6 +148,11 @@ class HumanML3DTextMotionDataset(Dataset):
         self.min_motion_len = int(min_motion_len)
         self.unit_length = int(unit_length)
         self.random_heading_aug = bool(random_heading_aug)
+        # Optional: clamp normalized features to +/- this value. The HumanML3D
+        # kimodo stats are per-block-constant and the velocities block has a
+        # small std, so rare fast frames normalize to |x| ~ 65; clamping caps
+        # their contribution to the (x0) loss and gradients. None = no clamp.
+        self.clip_normalized = float(clip_normalized) if clip_normalized else None
 
         if skeleton is None:
             skeleton = SMPLXSkeleton22()
@@ -310,6 +316,8 @@ class HumanML3DTextMotionDataset(Dataset):
 
         # Normalize
         feats = (feats - self.mean) / self.std
+        if self.clip_normalized is not None:
+            feats = np.clip(feats, -self.clip_normalized, self.clip_normalized)
 
         # Pad to max_motion_length on the right with zeros.
         motion = np.zeros((self.max_motion_length, feats.shape[1]), dtype=np.float32)
