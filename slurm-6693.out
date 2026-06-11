@@ -1,0 +1,5 @@
+[12:55:42] Evaluating mdm_hml3d_native_fp32
+  ckpt: /home/jungbin_cho/kimodo_open/runs/mdm_hml3d_native_fp32/ckpt_step0500000.pt
+  log:  /home/jungbin_cho/kimodo_open/runs/mdm_hml3d_native_fp32/eval_ckpt_step0500000.log
+  json: /home/jungbin_cho/kimodo_open/runs/mdm_hml3d_native_fp32/eval_ckpt_step0500000.json
+[2026-06-09T12:55:47.967] error: *** JOB 6693 ON pilabslurm-a2nodeset-0 CANCELLED AT 2026-06-09T12:55:47 DUE to SIGNAL Terminated ***

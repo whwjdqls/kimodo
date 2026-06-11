@@ -1,0 +1,34 @@
+# MDM model schema for HumanML3D-in-Kimodo training, CLIP text encoder.
+#
+# This file is identical to ``mdm_humanml3d_small_clip.yaml`` except that
+# ``motion_mask_mode`` is set to ``none``. It exists to isolate the
+# effect of the mask-concat input channel in the MDM-on-kimodo-rep run.
+#
+# Pair with ``configs/training/hml3d_mdm_clip_nomask.yaml``.
+_target_: kimodo.model.Kimodo
+num_base_steps: 1000
+cfg_type: separated
+denoiser:
+  _target_: kimodo.model.onestage_denoiser.OnestageDenoiser
+  ckpt_path: ${oc.select:checkpoint_dir, null}/model.safetensors
+  motion_mask_mode: none
+  motion_rep:
+    _target_: kimodo.motion_rep.KimodoMotionRep
+    fps: 20
+    stats_path: ${oc.select:checkpoint_dir, null}/stats/motion/
+    skeleton:
+      _target_: kimodo.skeleton.SMPLXSkeleton22
+  llm_shape:
+  - 1
+  - 512
+  use_text_mask: false
+  latent_dim: 512
+  ff_size: 1024
+  num_layers: 8
+  num_heads: 4
+  activation: gelu
+  dropout: 0.1
+  pe_dropout: 0.1
+  norm_first: false
+  num_text_tokens_override: 1
+  input_first_heading_angle: true

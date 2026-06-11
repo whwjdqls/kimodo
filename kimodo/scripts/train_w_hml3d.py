@@ -79,10 +79,102 @@ log = logging.getLogger("kimodo.train_hml3d")
 
 
 # -----------------------------------------------------------------------------
-# Viz — HumanML3D-aware (no skeleton.fk)
+# Viz — HumanML3D-aware (chain-reset FK from rotations, shared with the loss)
 # -----------------------------------------------------------------------------
 @torch.no_grad()
-def viz_generate_samples_hml3d(
+def _cfg_sample(
+    raw: nn.Module,
+    diffusion: Diffusion,
+    *,
+    text_feat: torch.Tensor,
+    text_pad_mask: torch.Tensor,
+    pad_mask: torch.Tensor,
+    first_heading: torch.Tensor,
+    motion_mask: torch.Tensor,
+    observed: torch.Tensor,
+    n_steps: int,
+    cfg_scale: float,
+    device: torch.device,
+    sampler: str = "ddim",
+) -> torch.Tensor:
+    """Classifier-free-guided x0 sampler with selectable reverse-step rule.
+
+    The model is trained with ``text_drop_prob`` (zeroed text features = the
+    unconditional case); we recover the conditional and unconditional x0
+    predictions in a single doubled-batch forward pass and combine them as
+    ``x0_cfg = x0_uncond + scale * (x0_cond - x0_uncond)``.
+
+    ``cfg_scale <= 1.0`` short-circuits to plain (conditional-only) sampling.
+
+    ``sampler``:
+      - ``"ddim"`` (default): deterministic DDIM (η=0). Matches the previous
+        behavior; safe to use with subsampled ``n_steps`` (e.g. 50).
+      - ``"ddpm"``: stochastic ancestral sampling. Computes the DDPM posterior
+        mean from the predicted x̂₀ and adds ``sqrt(posterior_variance) * z``
+        at every step except the last (t=0). Use with ``n_steps`` close to the
+        training schedule (e.g. 1000) for paper-faithful MDM-style sampling.
+    """
+    if sampler not in ("ddim", "ddpm"):
+        raise ValueError(f"sampler must be 'ddim' or 'ddpm'; got {sampler!r}")
+
+    B, T = pad_mask.shape
+    D = raw.motion_rep.motion_rep_dim
+
+    use_timesteps, map_tensor = diffusion.space_timesteps(n_steps)
+    diffusion.calc_diffusion_vars(use_timesteps)
+    cur = torch.randn(B, T, D, device=device)
+
+    do_cfg = cfg_scale is not None and float(cfg_scale) > 1.0
+    if do_cfg:
+        text_feat_2x = torch.cat([text_feat, torch.zeros_like(text_feat)], dim=0)
+        text_pad_2x = torch.cat([text_pad_mask, text_pad_mask], dim=0)
+        pad_2x = torch.cat([pad_mask, pad_mask], dim=0)
+        fh_2x = torch.cat([first_heading, first_heading], dim=0)
+        mm_2x = torch.cat([motion_mask, motion_mask], dim=0)
+        obs_2x = torch.cat([observed, observed], dim=0)
+
+    for i in list(range(n_steps))[::-1]:
+        t = torch.full((B,), i, device=device, dtype=torch.long)
+        t_map = map_tensor[t]
+        if do_cfg:
+            cur_2x = torch.cat([cur, cur], dim=0)
+            t_2x = torch.cat([t_map, t_map], dim=0)
+            pred_2x = raw(
+                cur_2x, pad_2x, text_feat_2x, text_pad_2x, t_2x,
+                first_heading_angle=fh_2x,
+                motion_mask=mm_2x, observed_motion=obs_2x,
+            )
+            pred_cond, pred_uncond = pred_2x[:B], pred_2x[B:]
+            pred_clean = pred_uncond + float(cfg_scale) * (pred_cond - pred_uncond)
+        else:
+            pred_clean = raw(
+                cur, pad_mask, text_feat, text_pad_mask, t_map,
+                first_heading_angle=first_heading,
+                motion_mask=motion_mask, observed_motion=observed,
+            )
+
+        if sampler == "ddim":
+            eps = (
+                diffusion.sqrt_recip_alphas_cumprod[t, None, None] * cur - pred_clean
+            ) / diffusion.sqrt_recipm1_alphas_cumprod[t, None, None]
+            alpha_bar_prev = diffusion.alphas_cumprod_prev[t, None, None]
+            cur = pred_clean * alpha_bar_prev.sqrt() + (1 - alpha_bar_prev).sqrt() * eps
+        else:  # "ddpm"
+            mean = (
+                diffusion.posterior_mean_coef1[t, None, None] * pred_clean
+                + diffusion.posterior_mean_coef2[t, None, None] * cur
+            )
+            if i > 0:
+                noise = torch.randn_like(cur)
+                log_var = diffusion.posterior_log_variance_clipped[t, None, None]
+                cur = mean + torch.exp(0.5 * log_var) * noise
+            else:
+                cur = mean
+    return cur
+
+
+@torch.no_grad()
+def viz_step(
     denoiser: nn.Module,
     diffusion: Diffusion,
     text_encoder,
@@ -92,62 +184,167 @@ def viz_generate_samples_hml3d(
     out_dir: Path,
     mean: np.ndarray,
     std: np.ndarray,
+    loss_fn,  # KimodoLoss — reused for FK so viz matches training-time supervision
+    prompts: Optional[list] = None,
+    test_examples: Optional[List[dict]] = None,
+    tb_writer=None,
 ) -> None:
-    """Sample motions and save the unnormalized (T, 273) features per prompt.
+    """Unified per-step viz mirroring ``train.py``'s ``viz_step``.
 
-    We DO NOT call ``motion_rep.inverse`` here because the data's
-    ``global_rot_data`` follows HumanML3D's chain-reset semantics. The saved
-    NPZ contains the raw kimodo features; convert to HumanML3D 263-D and
-    render with ``benchmark/humanml3d_to_kimodo.kimodo_to_humanml3d`` +
-    ``recover_from_ric`` in a separate post-processing step.
+    Layout: ``<out_dir>/<step:07d>/<i>_<id>.{npz,mp4}``.
+
+    Items come from two sources, batched into a SINGLE diffusion forward:
+      1. ``extra_prompts`` (passed via the ``prompts`` arg; defaults to
+         ``cfg.viz.prompts``) — no GT. Length = ``cfg.viz.num_frames``.
+      2. ``test_examples`` (when supplied) — held-out ``{id, caption,
+         gt_features, length}`` tuples from ``_load_test_examples``.
+
+    NPZ contains the generated unnormalized features ``(T, 273)`` + prompt
+    (and, for test items, the GT features for inspection). MP4 is the
+    side-by-side stick figure (GT left, gen right; left panel is blank when
+    no GT exists).
+
+    Joints are recomputed by FK on the predicted (or GT) global rotations,
+    matching the inference convention (the model's deployment-time output is
+    rotations + root; positions are reconstructed downstream). HML3D needs
+    the chain-reset variant — standard parent-relative FK as in
+    ``motion_rep.inverse`` would interpret the stored chain-reset rotations
+    incorrectly. The actual world root is reconstructed from features the
+    same way ``KimodoMotionRep.inverse`` does
+    (``local_jp[pelvis] + (smooth_root_x, 0, smooth_root_z)``); per-sample
+    bone lengths come from each item's own positions block (HML3D uniform-
+    skeletons every sample, so these are constant across the dataset and
+    deriving per-item is purely a cosmetic choice over caching).
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    import imageio.v3 as iio
+
+    from kimodo.scripts.render_hml3d import render_sidebyside
+
+    step_dir = out_dir / f"{step:07d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
     raw = (denoiser.module if hasattr(denoiser, "module") else denoiser).eval()
     motion_rep = raw.motion_rep
-    prompts = list(cfg.viz.prompts)
-    num_frames = int(cfg.viz.num_frames)
     n_steps = int(cfg.viz.num_denoising_steps)
+    cfg_scale = float(cfg.viz.get("cfg_scale", 2.5))
+    fps = int(cfg.data.get("fps", 20))
+    num_frames_default = int(cfg.viz.num_frames)
+    save_mp4 = bool(cfg.viz.get("save_videos", True))
 
-    text_feat = encode_texts(text_encoder, prompts, device)
-    text_pad_mask = torch.ones(text_feat.shape[:2], dtype=torch.bool, device=device)
+    if prompts is None:
+        prompts = [
+            p for p in (cfg.viz.get("prompts", []) or [])
+            if isinstance(p, str) and p
+        ]
+    else:
+        prompts = list(prompts)
+    test_examples = test_examples or []
 
-    B = len(prompts)
-    pad_mask = torch.ones(B, num_frames, dtype=torch.bool, device=device)
+    items: List[dict] = []
+    for i, p in enumerate(prompts):
+        safe = p.lower().replace(" ", "_").replace(".", "")[:40] or f"prompt_{i}"
+        items.append({
+            "id": f"prompt_{i:02d}_{safe}",
+            "caption": p,
+            "gt_features": None,
+            "length": num_frames_default,
+        })
+    for ex in test_examples:
+        items.append({
+            "id": ex["id"],
+            "caption": ex["caption"],
+            "gt_features": ex["gt_features"],  # already-unnormalized (T, 273)
+            "length": int(ex["length"]),
+        })
+    if not items:
+        return
+
+    captions = [it["caption"] for it in items]
+    lengths = [it["length"] for it in items]
+    max_T = int(max(lengths))
+    B = len(items)
+
+    text_feat, text_pad_mask = encode_texts(text_encoder, captions, device)
+    pad_mask = torch.zeros(B, max_T, dtype=torch.bool, device=device)
+    for i, L in enumerate(lengths):
+        pad_mask[i, :L] = True
     first_heading = torch.zeros(B, device=device)
-    motion_mask = torch.zeros(B, num_frames, motion_rep.motion_rep_dim, device=device)
-    observed = torch.zeros(B, num_frames, motion_rep.motion_rep_dim, device=device)
+    motion_mask = torch.zeros(B, max_T, motion_rep.motion_rep_dim, device=device)
+    observed = torch.zeros(B, max_T, motion_rep.motion_rep_dim, device=device)
 
-    use_timesteps, map_tensor = diffusion.space_timesteps(n_steps)
-    diffusion.calc_diffusion_vars(use_timesteps)
-
-    cur = torch.randn(B, num_frames, motion_rep.motion_rep_dim, device=device)
-    for i in list(range(n_steps))[::-1]:
-        t = torch.full((B,), i, device=device, dtype=torch.long)
-        t_map = map_tensor[t]
-        pred_clean = raw(
-            cur, pad_mask, text_feat, text_pad_mask, t_map,
-            first_heading_angle=first_heading,
-            motion_mask=motion_mask, observed_motion=observed,
-        )
-        eps = (
-            diffusion.sqrt_recip_alphas_cumprod[t, None, None] * cur - pred_clean
-        ) / diffusion.sqrt_recipm1_alphas_cumprod[t, None, None]
-        alpha_bar_prev = diffusion.alphas_cumprod_prev[t, None, None]
-        cur = pred_clean * alpha_bar_prev.sqrt() + (1 - alpha_bar_prev).sqrt() * eps
-
+    cur = _cfg_sample(
+        raw, diffusion,
+        text_feat=text_feat, text_pad_mask=text_pad_mask,
+        pad_mask=pad_mask, first_heading=first_heading,
+        motion_mask=motion_mask, observed=observed,
+        n_steps=n_steps, cfg_scale=cfg_scale, device=device,
+    )  # (B, max_T, D) normalized
     raw.train()
 
-    # cur is normalized; unnormalize back to raw kimodo features.
-    motion = cur.float().cpu().numpy()
-    motion = motion * std + mean  # (B, T, 273)
-    for i, prompt in enumerate(prompts):
-        safe = prompt.lower().replace(" ", "_").replace(".", "")[:40]
-        np.savez(
-            out_dir / f"step{step:07d}_{i}_{safe}.npz",
-            features=motion[i],
-            prompt=prompt,
-        )
-    log.info("Wrote %d HumanML3D viz samples (raw kimodo features) to %s", B, out_dir)
+    mean_t = torch.from_numpy(mean).to(cur.device)
+    std_t = torch.from_numpy(std).to(cur.device)
+    gen_unnorm = cur.float() * std_t + mean_t  # (B, max_T, 273)
+
+    # TensorBoard add_video is OFF by default: it requires a (N, Tmax, 3, H, W)
+    # *float32* stack which at the default render res (1200x600) for B=6 items
+    # peaks at ~10 GB of host RAM and has caused OOM-kills on slurm nodes. The
+    # per-item mp4 files already land on disk, so TB videos are redundant.
+    # Set ``cfg.viz.tb_videos: true`` to opt in (and ideally lower the render
+    # resolution or num_test_samples first).
+    tb_videos = bool(cfg.viz.get("tb_videos", False)) and (tb_writer is not None)
+    video_stack: List[np.ndarray] = []
+    for i, it in enumerate(items):
+        L = it["length"]
+        gen_feats = gen_unnorm[i, :L]  # (L, 273)
+        gen_joints = loss_fn._fk_world_from_pred(
+            gen_feats.unsqueeze(0),
+        )[0].cpu().numpy()
+        gen_feats_np = gen_feats.cpu().numpy()
+
+        gt_joints: Optional[np.ndarray] = None
+        npz_kwargs = {"features": gen_feats_np, "prompt": it["caption"]}
+        if it["gt_features"] is not None:
+            gt_feats = torch.from_numpy(it["gt_features"]).to(device).unsqueeze(0)
+            gt_joints = loss_fn._fk_world_from_pred(gt_feats)[0].cpu().numpy()
+            npz_kwargs["gt_features"] = it["gt_features"]
+
+        base = step_dir / f"{i:02d}_{it['id']}"
+        np.savez(base.with_suffix(".npz"), **npz_kwargs)
+        if not save_mp4:
+            continue
+        try:
+            frames = render_sidebyside(gt_joints, gen_joints, caption=it["caption"])
+        except Exception as e:
+            log.warning("Render failed for %s: %s", it["id"], e)
+            continue
+        try:
+            iio.imwrite(
+                str(base.with_suffix(".mp4")), frames,
+                fps=float(fps), codec="h264", plugin="pyav",
+            )
+        except Exception as e:
+            log.warning("MP4 write failed for %s: %s", it["id"], e)
+        if tb_videos:
+            video_stack.append(frames)
+        else:
+            # Drop the (T,H,W,3) buffer immediately so peak RSS stays at ~1 item's
+            # worth of frames (~430 MB at 1200x600x200) instead of B items'.
+            del frames
+
+    if tb_videos and video_stack:
+        Tmax = max(v.shape[0] for v in video_stack)
+        H, W = video_stack[0].shape[1:3]
+        vids = np.zeros((len(video_stack), Tmax, 3, H, W), dtype=np.float32)
+        for n, v in enumerate(video_stack):
+            vt = np.transpose(v, (0, 3, 1, 2)).astype(np.float32) / 255.0
+            vids[n, : vt.shape[0]] = vt
+            if vt.shape[0] < Tmax:
+                vids[n, vt.shape[0]:] = vt[-1]
+        try:
+            tb_writer.add_video("viz", torch.from_numpy(vids), global_step=step, fps=fps)
+        except Exception as e:
+            log.warning("TensorBoard add_video failed (%s); skipping.", e)
+
+    log.info("Wrote %d viz samples to %s", len(items), step_dir)
 
 
 # -----------------------------------------------------------------------------
@@ -214,128 +411,6 @@ def _load_test_examples(
     return out
 
 
-@torch.no_grad()
-def viz_test_vs_gt(
-    denoiser: nn.Module,
-    diffusion: Diffusion,
-    text_encoder,
-    device: torch.device,
-    cfg: DictConfig,
-    step: int,
-    out_dir: Path,
-    mean: np.ndarray,
-    std: np.ndarray,
-    test_examples: list,
-    tb_writer=None,
-) -> None:
-    """Generate motion for held-out test captions and render side-by-side with GT.
-
-    Writes one MP4 per example to ``out_dir`` and (if a TensorBoard writer is
-    given) logs a stacked video under ``viz/test_vs_gt``.
-    """
-    import imageio.v3 as iio
-
-    from kimodo.motion_rep.fk_hml3d import world_joints_from_kimodo_features
-    from kimodo.scripts.render_hml3d import render_sidebyside
-
-    if not test_examples:
-        return
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    raw = (denoiser.module if hasattr(denoiser, "module") else denoiser).eval()
-    motion_rep = raw.motion_rep
-    n_steps = int(cfg.viz.num_denoising_steps)
-    fps = int(cfg.data.get("fps", 20))
-    mean_t = torch.from_numpy(mean).to(device)
-    std_t = torch.from_numpy(std).to(device)
-
-    # Batch all examples to a common padded length for one diffusion pass.
-    lengths = [ex["length"] for ex in test_examples]
-    captions = [ex["caption"] for ex in test_examples]
-    max_T = int(max(lengths))
-    B = len(test_examples)
-
-    text_feat = encode_texts(text_encoder, captions, device)
-    text_pad_mask = torch.ones(text_feat.shape[:2], dtype=torch.bool, device=device)
-    pad_mask = torch.zeros(B, max_T, dtype=torch.bool, device=device)
-    for i, L in enumerate(lengths):
-        pad_mask[i, :L] = True
-    first_heading = torch.zeros(B, device=device)
-    motion_mask = torch.zeros(B, max_T, motion_rep.motion_rep_dim, device=device)
-    observed = torch.zeros(B, max_T, motion_rep.motion_rep_dim, device=device)
-
-    use_timesteps, map_tensor = diffusion.space_timesteps(n_steps)
-    diffusion.calc_diffusion_vars(use_timesteps)
-    cur = torch.randn(B, max_T, motion_rep.motion_rep_dim, device=device)
-    for i in list(range(n_steps))[::-1]:
-        t = torch.full((B,), i, device=device, dtype=torch.long)
-        t_map = map_tensor[t]
-        pred_clean = raw(
-            cur, pad_mask, text_feat, text_pad_mask, t_map,
-            first_heading_angle=first_heading,
-            motion_mask=motion_mask, observed_motion=observed,
-        )
-        eps = (
-            diffusion.sqrt_recip_alphas_cumprod[t, None, None] * cur - pred_clean
-        ) / diffusion.sqrt_recipm1_alphas_cumprod[t, None, None]
-        alpha_bar_prev = diffusion.alphas_cumprod_prev[t, None, None]
-        cur = pred_clean * alpha_bar_prev.sqrt() + (1 - alpha_bar_prev).sqrt() * eps
-    raw.train()
-
-    gen_unnorm = cur.float() * std_t + mean_t  # (B, max_T, 273), normalized -> raw
-
-    video_stack = []  # for tensorboard: list of (T, H, W, 3)
-    for i, ex in enumerate(test_examples):
-        L = ex["length"]
-        gen_feats = gen_unnorm[i, :L].unsqueeze(0)  # (1, L, 273)
-        gt_feats = torch.from_numpy(ex["gt_features"]).to(device).unsqueeze(0)  # already unnormalized
-
-        gen_joints = world_joints_from_kimodo_features(
-            gen_feats, motion_rep.slice_dict, n_joints=motion_rep.nbjoints,
-        )[0].cpu().numpy()
-        gt_joints = world_joints_from_kimodo_features(
-            gt_feats, motion_rep.slice_dict, n_joints=motion_rep.nbjoints,
-        )[0].cpu().numpy()
-
-        frames = render_sidebyside(gt_joints, gen_joints, caption=ex["caption"])  # (Tr, H, W, 3)
-        mp4_path = out_dir / f"step{step:07d}_{ex['id']}_gt_vs_gen.mp4"
-        try:
-            iio.imwrite(str(mp4_path), frames, fps=float(fps), codec="h264", plugin="pyav")
-        except Exception as e:
-            log.warning("MP4 write failed for %s (%s); skipping file.", ex["id"], e)
-        video_stack.append(frames)
-
-    if tb_writer is not None and video_stack:
-        # add_video wants (N, T, C, H, W) in [0,1]. Pad to common T.
-        Tmax = max(v.shape[0] for v in video_stack)
-        H, W = video_stack[0].shape[1:3]
-        vids = np.zeros((len(video_stack), Tmax, 3, H, W), dtype=np.float32)
-        for n, v in enumerate(video_stack):
-            vt = np.transpose(v, (0, 3, 1, 2)).astype(np.float32) / 255.0  # (T, C, H, W)
-            vids[n, : vt.shape[0]] = vt
-            if vt.shape[0] < Tmax:  # freeze last frame for padding
-                vids[n, vt.shape[0]:] = vt[-1]
-        video_ok = False
-        try:
-            tb_writer.add_video("viz/test_vs_gt", torch.from_numpy(vids), global_step=step, fps=fps)
-            video_ok = True
-        except Exception as e:
-            log.warning("TensorBoard add_video failed (%s); logging frame strips instead.", e)
-        if not video_ok:
-            # Fallback: log a horizontal strip of ~5 evenly-spaced frames per sample.
-            for n, v in enumerate(video_stack):
-                k = min(5, v.shape[0])
-                sel = np.linspace(0, v.shape[0] - 1, k, dtype=int)
-                strip = np.concatenate([v[s] for s in sel], axis=1)  # (H, k*W, 3)
-                tb_writer.add_image(
-                    f"viz/test_vs_gt/{test_examples[n]['id']}",
-                    torch.from_numpy(strip).permute(2, 0, 1),  # (3, H, kW)
-                    global_step=step,
-                )
-
-    log.info("Wrote %d test-vs-GT side-by-side videos to %s", len(test_examples), out_dir)
-
-
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -363,8 +438,8 @@ def main() -> None:
 
     output_dir = Path(cfg.output_dir)
     if env.is_main:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        OmegaConf.save(cfg, output_dir / "config.yaml")
+        from kimodo.scripts._config_snapshot import snapshot_configs
+        snapshot_configs(cfg, output_dir)
     maybe_barrier()
 
     log_path = output_dir / f"train_rank{env.rank}.log"
@@ -488,20 +563,30 @@ def main() -> None:
         ema = ModelEMA(denoiser, decay=float(cfg.trainer.ema_decay))
 
     # ----- text encoder (frozen, serialized across ranks) -----
-    log.info(
-        "Building text encoder (HF_HUB_OFFLINE=%s, KIMODO_TEXT_ENCODER_LOCAL_DIR=%s) ...",
-        os.environ.get("HF_HUB_OFFLINE", "0"),
-        os.environ.get("KIMODO_TEXT_ENCODER_LOCAL_DIR", "(unset)"),
-    )
+    _enc_type = str(cfg.text_encoder.get("type", "llm2vec")).lower()
+    _enc_cache = cfg.text_encoder.get("cache_path", None)
+    if _enc_cache:
+        log.info("Building text encoder: cached (cache_path=%s) — live encoder NOT loaded.", _enc_cache)
+    elif _enc_type == "llm2vec":
+        log.info(
+            "Building text encoder: llm2vec (HF_HUB_OFFLINE=%s, KIMODO_TEXT_ENCODER_LOCAL_DIR=%s) ...",
+            os.environ.get("HF_HUB_OFFLINE", "0"),
+            os.environ.get("KIMODO_TEXT_ENCODER_LOCAL_DIR", "(unset)"),
+        )
+    else:
+        log.info("Building text encoder: %s (model=%s) ...",
+                 _enc_type, cfg.text_encoder.get("model_name", "(default)"))
+
     if env.is_distributed:
         for r in range(env.world_size):
             if env.rank == r:
                 log.info("Rank %d building text encoder ...", r)
                 text_encoder = build_text_encoder(cfg.text_encoder, device=device)
-                log.info("Rank %d text encoder built.", r)
+                log.info("Rank %d text encoder built (class=%s).", r, type(text_encoder).__name__)
             maybe_barrier()
     else:
         text_encoder = build_text_encoder(cfg.text_encoder, device=device)
+        log.info("Text encoder built (class=%s).", type(text_encoder).__name__)
 
     # ----- DDP wrap -----
     if env.is_distributed:
@@ -579,7 +664,7 @@ def main() -> None:
 
     grad_accum = int(cfg.trainer.grad_accum)
     log_every = int(cfg.trainer.log_every)
-    print_every = int(cfg.trainer.get("print_every", 1))
+    print_every = int(cfg.trainer.get("print_every", 50))
     ckpt_every = int(cfg.trainer.ckpt_every)
     viz_every = int(cfg.trainer.viz_every)
     grad_clip = float(cfg.trainer.grad_clip)
@@ -621,12 +706,34 @@ def main() -> None:
             )
             grad_norm_val = float(grad_norm)
             agg_loss["grad_norm"] = grad_norm_val
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
+
+            # Guard against catastrophic batches that would corrupt Adam's
+            # moment estimates (m, v). A non-finite or huge pre-clip grad_norm
+            # almost always comes from a single bad batch (degenerate FK input,
+            # bf16 underflow, etc.); skipping the step keeps the optimizer
+            # state clean instead of letting one update poison the next 100k.
+            # The spike is still logged below (train/grad_norm + train/grad_skip)
+            # so it shows up in TensorBoard.
+            grad_guard_max = float(cfg.trainer.get("grad_guard_max", 100.0))
+            skipped_step = (not torch.isfinite(grad_norm)) or grad_norm_val > grad_guard_max
+            agg_loss["grad_skip"] = 1.0 if skipped_step else 0.0
+
+            if skipped_step:
+                log.warning(
+                    "step %d: SKIPPING optimizer step (grad_norm=%.3e non-finite or > %.1f).",
+                    step + 1, grad_norm_val, grad_guard_max,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    # Tell the scaler we skipped, so it doesn't decay the scale.
+                    scaler.update()
             else:
-                optimizer.step()
-            scheduler.step()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                scheduler.step()
 
             if ema is not None and step % ema_every == 0:
                 ema.update(denoiser.module if hasattr(denoiser, "module") else denoiser)
@@ -694,21 +801,26 @@ def main() -> None:
 
             if env.is_main and viz_every and step % viz_every == 0:
                 try:
-                    viz_generate_samples_hml3d(
+                    # Unified viz: one diffusion forward, one folder per step
+                    # with npz + side-by-side mp4 per item. test_examples carry
+                    # GT (rendered on the left); any extra prompts have no GT
+                    # (blank left panel). When test_examples is non-empty we
+                    # skip the fixed cfg.viz.prompts list to avoid duplicating
+                    # the work.
+                    fallback_prompts = (
+                        None if test_examples
+                        else [p for p in (cfg.viz.get("prompts", []) or []) if isinstance(p, str) and p]
+                    )
+                    viz_step(
                         denoiser, diffusion, text_encoder, device, cfg, step,
                         output_dir / "viz", mean=mean, std=std,
+                        loss_fn=loss_fn,
+                        prompts=fallback_prompts,
+                        test_examples=test_examples,
+                        tb_writer=tb_writer,
                     )
                 except Exception as e:
                     log.warning("Viz failed at step %d: %s", step, e)
-                if test_examples:
-                    try:
-                        viz_test_vs_gt(
-                            denoiser, diffusion, text_encoder, device, cfg, step,
-                            output_dir / "viz_test_vs_gt", mean=mean, std=std,
-                            test_examples=test_examples, tb_writer=tb_writer,
-                        )
-                    except Exception as e:
-                        log.warning("Test-vs-GT viz failed at step %d: %s", step, e)
 
             if step >= num_steps:
                 break

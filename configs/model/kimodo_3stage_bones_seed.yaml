@@ -1,0 +1,73 @@
+# 3-stage Kimodo model schema for bones_seed (SOMA) training.
+#
+# motion_denoiser is byte-identical to runs/bones_seed_small/model_config.yaml
+# (SOMA-SEED-v1.1 architecture: SOMASkeleton30, latent 1024, 16 layers, 8 heads,
+# num_text_tokens_override=50) so we can warm-start it from a single-stage
+# bones_seed checkpoint without architecture mismatches.
+#
+# Mask + Constraint generators are smaller (latent 256 / 384), matching the
+# HumanML3D 3-stage config's sizing — they only need to produce a single x0
+# tensor per forward, not run a 1000-step diffusion.
+
+motion_denoiser:
+  _target_: kimodo.model.twostage_denoiser.TwostageDenoiser
+  ckpt_path: ${oc.select:checkpoint_dir, null}/model.safetensors
+  motion_mask_mode: concat
+  motion_rep:
+    _target_: kimodo.motion_rep.KimodoMotionRep
+    fps: 30
+    stats_path: ${oc.select:checkpoint_dir, null}/stats/motion/
+    skeleton:
+      _target_: kimodo.skeleton.SOMASkeleton30
+  llm_shape:
+  - 1
+  - 4096
+  use_text_mask: false
+  latent_dim: 1024
+  ff_size: 2048
+  num_layers: 16
+  num_heads: 8
+  activation: gelu
+  dropout: 0.0
+  pe_dropout: 0.0
+  norm_first: false
+  num_text_tokens_override: 50
+  input_first_heading_angle: true
+
+# Stage 1 — predicts the binary-ish constraint MASK from text + pad_mask.
+mask_generator:
+  _target_: kimodo.model.mask_generator.MaskGenerator
+  llm_shape:
+  - 1
+  - 4096
+  use_text_mask: false
+  latent_dim: 256
+  ff_size: 512
+  num_layers: 4
+  num_heads: 4
+  activation: gelu
+  dropout: 0.1
+  pe_dropout: 0.1
+  norm_first: false
+  num_text_tokens_override: 50
+
+# Stage 2 — predicts the constraint VALUES (same shape as motion features).
+constraint_generator:
+  _target_: kimodo.model.constraint_generator.ConstraintGenerator
+  llm_shape:
+  - 1
+  - 4096
+  use_text_mask: false
+  latent_dim: 384
+  ff_size: 768
+  num_layers: 6
+  num_heads: 4
+  activation: gelu
+  dropout: 0.1
+  pe_dropout: 0.1
+  norm_first: false
+  num_text_tokens_override: 50
+
+# Diffusion (used by the training script at Stage 3).
+diffusion:
+  num_base_steps: 1000

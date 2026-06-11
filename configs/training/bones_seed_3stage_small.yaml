@@ -1,0 +1,100 @@
+# Training config — 3-stage text-to-motion model on bones_seed (SOMA) data.
+#
+# Based on bones_seed_small.yaml + the HumanML3D 3-stage knobs.
+# Stage 3 (motion_denoiser) is warm-started from runs/bones_seed_small/latest.pt
+# — same architecture (SOMA-SEED-v1.1) so the load fits without mismatches.
+# Stages 1 & 2 train from scratch.
+
+# ----- data -----  (same dataset / split as bones_seed_small)
+data:
+  kind: bones_seed
+  data_root: /home/jungbin_cho/seed/soma_uniform_motions_20fps
+  natural_csv_path: /home/jungbin_cho/seed/metadata/seed_metadata_v004.csv
+  temporal_labels_path: /home/jungbin_cho/seed/metadata/seed_metadata_v002_temporal_labels.jsonl
+  multi_timeline_path: /home/jungbin_cho/seed/multi_timeline.jsonl
+  train_split_path: /home/jungbin_cho/Kimodo-Motion-Gen-Benchmark/splits/train_split_paths_small.txt
+  fps: 20
+  min_frames: 10
+  max_frames: 200
+  max_clip_sec: 10.0
+  max_segment_sec: 15.0
+  rand_offset_max_sec: 2.0
+  include_mirrored: true
+  random_heading_aug: true
+  cache_index: /home/jungbin_cho/kimodo_caches/seg_index_small.json
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+
+# ----- model -----
+model_config_path: /home/jungbin_cho/kimodo_open/configs/model/kimodo_3stage_bones_seed.yaml
+stats_path: /home/jungbin_cho/Kimodo-SOMA-SEED-v1.1/stats/motion/
+denoiser_fps_override: 20
+
+# Optional warm-starts. Leave null to train from scratch.
+# motion_denoiser: warm-start Stage 3 from the bones_seed_small single-stage run.
+# That .pt's weights live under top-level 'denoiser' as ``root_model.*`` — the
+# loader auto-unwraps and the keys then match three_stage.denoiser directly.
+init_motion_denoiser_safetensors: /home/jungbin_cho/kimodo_open/runs/bones_seed_small/latest.pt
+init_mask_generator_safetensors: null
+init_constraint_generator_safetensors: null
+
+# ----- text encoder (frozen LLM2Vec) -----
+text_encoder:
+  type: llm2vec
+  device: auto
+  fp32: false
+  cache_path: /home/jungbin_cho/kimodo_caches/bones_seed_llm2vec_small.pt
+
+# ----- training loop -----
+trainer:
+  output_dir: ${output_dir}
+  batch_size: 32          # smaller than single-stage (64) — three transformers in memory
+  grad_accum: 1
+  num_steps: 500_000
+  lr: 2.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  warmup_steps: 1000
+  log_every: 50
+  ckpt_every: 5000
+  viz_every: 5000
+  text_drop_prob: 0.1
+  mask_drop_prob: 0.1     # CFG-style drop of the whole (mask, observed_motion) — keeps
+                          # Stage 3 working at text-only inference (constraint dropped).
+  ema_decay: 0.995
+  ema_every: 10
+  mixed_precision: bf16
+  grad_clip: 1.0
+  resume_from: null
+  seed: 0
+
+  # Stage 3 / motion-denoiser loss weights (existing kimodo γ_1..γ_7).
+  loss_weights:
+    smooth_root_pos: 10.0
+    global_root_heading: 2.0
+    local_joints_positions: 10.0
+    velocities: 3.0
+    global_rot_data: 10.0
+    foot_contacts: 4.0
+    fk: 5.0
+  smooth_l1_beta: 1.0
+
+  # 3-stage-specific loss weights.
+  w_motion: 1.0          # weight on Stage 3 motion loss (the only "GT" loss)
+  w_stage2_aux: 1.0      # smooth_L1(values, GT_motion) — dense aux signal for Stage 2
+  w_sparsity: 5.0        # mean(mask_probs) regulariser — prevents mask=1 collapse
+  sparsity_target: 0.05  # if > 0, hinge: max(0, mean_mask - target)
+
+# ----- visualization -----
+viz:
+  num_samples: 2
+  prompts:
+    - "a person is walking forward."
+    - "a person is jumping in place."
+  num_frames: 100
+  num_denoising_steps: 50
+  cfg_weight: [2.0, 0.0]
+  mask_threshold: null     # null = soft sigmoid mask; 0.5 = threshold to binary
+
+output_dir: /home/jungbin_cho/kimodo_open/runs/bones_seed_3stage_small

@@ -1,0 +1,93 @@
+# Training config: KIMODO (two-stage) on HumanML3D-in-Kimodo features,
+# CLIP ViT-B/32 text encoder, WITHOUT the mask-concat input channel.
+#
+# This file is byte-identical to ``hml3d_clip.yaml`` except that
+# ``model_config_path`` points at the ``..._nomask`` model schema (which
+# flips ``motion_mask_mode`` from ``concat`` to ``none``). All other knobs
+# (data, stats, random_heading_aug, loss block weights, optimizer, EMA,
+# grad guard, viz cadence, schedule) are kept the same so the resulting
+# run can be A/B compared to ``runs/kim_hml3d_fp32`` and isolate the
+# effect of the mask channel.
+
+# ----- data -----
+data:
+  motion_dir: /home/jungbin_cho/HumanML3D/HumanML3D/kimodo_rep
+  text_dir: /home/jungbin_cho/HumanML3D/HumanML3D/texts
+  split_file: /home/jungbin_cho/HumanML3D/HumanML3D/train.txt
+  mean_path: /home/jungbin_cho/HumanML3D/HumanML3D/Mean_kimodo.npy
+  std_path: /home/jungbin_cho/HumanML3D/HumanML3D/Std_kimodo.npy
+  fps: 20
+  window_size: 200
+  max_motion_length: 200
+  min_motion_len: 40
+  unit_length: 4
+  random_heading_aug: true
+  clip_normalized: null
+  num_workers: 8
+  pin_memory: true
+
+# ----- model -----
+model_config_path: /home/jungbin_cho/kimodo_open/configs/model/kimodo_humanml3d_small_clip_nomask.yaml
+stats_path: /home/jungbin_cho/HumanML3D/HumanML3D/stats_kimodo
+denoiser_fps_override: 20
+init_from_safetensors: null
+
+# ----- text encoder -----
+text_encoder:
+  type: clip
+  model_name: openai/clip-vit-base-patch32
+  pooled: true
+  max_length: 22
+  device: auto
+  fp32: false
+
+# ----- training loop -----
+trainer:
+  output_dir: ${output_dir}
+  batch_size: 64
+  grad_accum: 1
+  num_steps: 500000
+  lr: 1.0e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  warmup_steps: 2000
+  log_every: 50
+  ckpt_every: 10000
+  viz_every: 10000
+  eval_every: 0
+  text_drop_prob: 0.1
+  ema_decay: 0.9999
+  ema_every: 1
+  mixed_precision: fp32
+  grad_clip: 1.0
+  # Skip optimizer step when pre-clip grad_norm > this (or non-finite).
+  # Healthy grad_norm ~0.05-0.2; 10.0 catches medium-bad batches before
+  # they corrupt Adam, without firing on normal noise. Default in code
+  # is 100, which is too lenient — bf16 runs missed early degradation.
+  grad_guard_max: 10.0
+  resume_from: null
+  seed: 0
+  loss_weights:
+    smooth_root_pos: 10.0
+    global_root_heading: 2.0
+    local_joints_positions: 10.0
+    velocities: 3.0
+    global_rot_data: 10.0
+    foot_contacts: 4.0
+    fk: 5.0
+  smooth_l1_beta: 1.0
+  phase: text
+
+# ----- visualization -----
+viz:
+  num_samples: 0
+  prompts: []
+  num_frames: 100
+  num_denoising_steps: 50
+  cfg_scale: 2.5
+  test_vs_gt: true
+  test_split_file: /home/jungbin_cho/HumanML3D/HumanML3D/test.txt
+  num_test_samples: 4
+  test_max_frames: 196
+
+output_dir: /home/jungbin_cho/kimodo_open/runs/kim_hml3d_nomask_fp32

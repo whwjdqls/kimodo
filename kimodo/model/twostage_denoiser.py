@@ -10,6 +10,7 @@ from torch import nn
 
 from .backbone import TransformerEncoderBlock
 from .loading import load_checkpoint_state_dict
+from .onestage_denoiser import _normalize_motion_mask_mode
 
 
 class TwostageDenoiser(nn.Module):
@@ -18,23 +19,32 @@ class TwostageDenoiser(nn.Module):
     def __init__(
         self,
         motion_rep,
-        motion_mask_mode,
+        motion_mask_mode: Optional[str] = "concat",
         ckpt_path: Optional[str] = None,
         **kwargs,
     ):
-        """Build root and body transformer blocks; optionally load checkpoint from ckpt_path."""
+        """Build root and body transformer blocks; optionally load checkpoint from ckpt_path.
+
+        ``motion_mask_mode`` selects whether the constraint mask is concatenated
+        as extra input channels (``"concat"``, default — the architecture is
+        constraint-ready) or omitted entirely (``"none"`` / YAML ``null`` —
+        pure text-to-motion; the ``motion_mask`` / ``observed_motion`` kwargs
+        on ``forward`` are accepted but silently ignored). See the constant
+        ``_VALID_MOTION_MASK_MODES`` in ``onestage_denoiser.py`` for the
+        canonical option set — the two denoisers share the same contract.
+        """
         super().__init__()
         self.motion_rep = motion_rep
-        self.motion_mask_mode = motion_mask_mode
+        self.motion_mask_mode = _normalize_motion_mask_mode(motion_mask_mode)
+        self._concat_mask = self.motion_mask_mode == "concat"
 
         # it should be a dual motion_rep
         # and be global by default
         # global motion_rep as inpnut
         input_dim = motion_rep.motion_rep_dim
-        will_concatenate = motion_mask_mode == "concat"
 
         # stage 1: root only
-        root_input_dim = input_dim * 2 if will_concatenate else input_dim
+        root_input_dim = input_dim * 2 if self._concat_mask else input_dim
         root_output_dim = motion_rep.global_root_dim
 
         self.root_model = TransformerEncoderBlock(
@@ -49,7 +59,7 @@ class TwostageDenoiser(nn.Module):
 
         # stage 2: local body
         body_input_dim = local_motion_rep_dim + (
-            input_dim if will_concatenate else 0
+            input_dim if self._concat_mask else 0
         )  # body stage always takes in local root info for motion (but still the global mask)
 
         body_output_dim = input_dim - motion_rep.global_root_dim
@@ -95,7 +105,7 @@ class TwostageDenoiser(nn.Module):
             torch.Tensor: same size as input x
         """
 
-        if self.motion_mask_mode == "concat":
+        if self._concat_mask:
             if motion_mask is None or observed_motion is None:
                 motion_mask = torch.zeros_like(x)
                 observed_motion = torch.zeros_like(x)
@@ -133,7 +143,7 @@ class TwostageDenoiser(nn.Module):
         body_x = x[..., self.motion_rep.body_slice]
         x_new = torch.cat([root_motion_local, body_x], axis=-1)
 
-        if self.motion_mask_mode == "concat":
+        if self._concat_mask:
             x_new_extended = torch.cat([x_new, motion_mask], axis=-1)
         else:
             x_new_extended = x_new

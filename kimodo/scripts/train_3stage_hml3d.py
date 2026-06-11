@@ -171,14 +171,17 @@ def train_one_step_3stage(
     pad_mask_f = pad_mask.to(motion.dtype)
 
     # Text encoding + CFG drop (existing logic from train.py).
+    # encode_texts returns (feats, pad_mask). For pooled encoders (LLM2Vec,
+    # CLIP-pooled) L=1 and the pad_mask is all-True, so the returned mask is
+    # what we want; per-token encoders also work since we just use the encoder's
+    # mask directly.
     keep_text = torch.rand(B) > text_drop_prob
     if not keep_text.all():
         texts = [t if k else "" for t, k in zip(texts, keep_text.tolist())]
-    text_feat = encode_texts(text_encoder, texts, device)
+    text_feat, text_pad_mask = encode_texts(text_encoder, texts, device)
     if not keep_text.all():
         keep_mask = keep_text.to(device=device, dtype=text_feat.dtype).view(-1, 1, 1)
         text_feat = text_feat * keep_mask
-    text_pad_mask = torch.ones(text_feat.shape[:2], dtype=torch.bool, device=device)
 
     # Autocast context (bf16/fp16 on CUDA only).
     autocast_ctx = (

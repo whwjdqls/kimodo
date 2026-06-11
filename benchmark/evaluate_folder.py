@@ -4,8 +4,33 @@
 """
 Step (4) of evaluation pipeline.
 
-This script recursively computes metrics for generated and ground-truth motions within a test suite folder tree. 
+This script recursively computes metrics for generated and ground-truth motions within a test suite folder tree.
 Saves metrics json files per test case and per group of test cases in the folder tree.
+
+FPS / metric-comparability notes (IMPORTANT when comparing against the published
+Kimodo benchmark at https://research.nvidia.com/labs/sil/projects/kimodo/docs/benchmark/results.html):
+
+  * The published results are at 30fps. Local SOMA data / test suite may be 20fps
+    (e.g. Kimodo-Motion-Gen-Benchmark-20fps). The two metric families behave differently:
+
+    - TMR FID / R-precision (R@3 etc.): fps-INVARIANT here, because TMR embeddings are
+      precomputed on motions resampled to the TMR model's 30fps (see the embed step,
+      e.g. run_eval_tiny_text2motion.sh: --src-fps 20 --tgt-fps 30). These reproduce the
+      published GT references directly regardless of source fps.
+    - Foot-skate (cm/s) and foot-contact-consistency: fps-SENSITIVE. They use
+      v = |Δpos| / dt with dt = 1/fps, and contact detection uses a velocity threshold.
+      You MUST pass --fps matching the ACTUAL fps of the motions (--fps 20 for 20fps data),
+      otherwise velocities are mis-scaled (default 30 on 20fps data -> velocities ~1.5x too
+      high, inflated skate, biased contact). --gt-fps/--motion-fps override per pass when GT
+      and generated motions differ in fps.
+
+  * Mapping local json fields -> published benchmark columns:
+      published "R@3"     == tmr["TMR/t2m_R/R03"]            (GT ceiling: TMR/t2m_gt_R/R03)
+      published "FID"     == tmr["TMR/FID/gen_gt"]           (raw, not x100; GT == 0 by definition)
+      published "Skate"   == foot_skate_from_pred_contacts * 100   (cm/s)  -- NOT foot_skate_ratio (a 0-1 fraction)
+      published "Contact" == foot_contact_consistency
+    Sanity check: with the correct --fps, local GT reproduces the published GT skate within
+    <1% even across the 20fps(local)/30fps(paper) gap, confirming cm/s skate is fps-robust.
 """
 
 import argparse
@@ -36,6 +61,9 @@ from kimodo.skeleton import build_skeleton
 from kimodo.skeleton.definitions import SOMASkeleton30
 from kimodo.tools import load_json, to_torch
 
+# Default assumes the published 30fps benchmark. For 20fps data/test suites you MUST pass
+# --fps 20 (or --gt-fps/--motion-fps) or the foot-skate/contact metrics will be mis-scaled.
+# Does NOT affect TMR FID/R-precision (precomputed embeddings). See module docstring.
 DEFAULT_FPS = 30.0
 
 
@@ -138,6 +166,7 @@ def _run_eval_on_group(
     device: str,
     group_name: str = "",
     soma30_skel: SOMASkeleton30 | None = None,
+    metrics_list_gt: list | None = None,
 ) -> tuple[
     list[dict[str, float]],
     list[dict[str, float]],
@@ -214,7 +243,11 @@ def _run_eval_on_group(
         tmr_per_sample = compute_tmr_per_sample_retrieval(motion_emb_stack, text_emb_stack, sample_ids, texts, top_k=5)
 
     # ----- Pass 2: GT (gt_motion.npz only, no embeddings) -----
-    clear_metrics(metrics_list)
+    # GT may be at a different fps than the generated motion (e.g. a 30fps model
+    # vs a 20fps benchmark GT); use a GT-specific metric set so foot-skate (cm/s)
+    # and velocity-thresholded contact metrics use the GT's true fps.
+    mgt = metrics_list_gt if metrics_list_gt is not None else metrics_list
+    clear_metrics(mgt)
     for sample_dir, rel_path in tqdm(group, desc=f"GT ({group_name})" if group_name else "GT", unit="motion"):
         posed_joints, foot_contacts = _load_npz_motion(sample_dir / "gt_motion.npz", device, soma30_skel)
         nframes = posed_joints.shape[0]
@@ -229,10 +262,10 @@ def _run_eval_on_group(
             "lengths": lengths,
             "constraints_lst": constraints_lst,
         }
-        compute_metrics(metrics_list, metrics_in)
+        compute_metrics(mgt, metrics_in)
 
-    per_sample_gt = _per_sample_metrics_from_saved(metrics_list, n)
-    raw_aggregated_gt = aggregate_metrics(metrics_list)
+    per_sample_gt = _per_sample_metrics_from_saved(mgt, n)
+    raw_aggregated_gt = aggregate_metrics(mgt)
     aggregated_gt = {}
     for key, v in raw_aggregated_gt.items():
         if key.startswith("TMR/"):
@@ -266,6 +299,28 @@ def main():
         help="Root folder to search recursively for meta.json + motion.npz + gt_motion.npz",
     )
     parser.add_argument("--device", default=None, help="cuda/cpu. Default: auto")
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=DEFAULT_FPS,
+        help=f"FPS of the motions being evaluated (default: {DEFAULT_FPS}). Sets both "
+        "--motion-fps and --gt-fps unless those are given explicitly. Foot-skate (cm/s) and "
+        "velocity-thresholded contact metrics are fps-sensitive, so this MUST match the actual "
+        "fps. It does not affect TMR FID/R-precision (precomputed embeddings).",
+    )
+    parser.add_argument(
+        "--motion-fps",
+        type=float,
+        default=None,
+        help="FPS of the generated motion.npz (overrides --fps for the gen pass). Use when the "
+        "model generates at a different fps than the GT, e.g. a 30fps model vs 20fps GT.",
+    )
+    parser.add_argument(
+        "--gt-fps",
+        type=float,
+        default=None,
+        help="FPS of gt_motion.npz (overrides --fps for the GT pass).",
+    )
     args = parser.parse_args()
 
     folder = args.folder.resolve()
@@ -293,16 +348,24 @@ def main():
     else:
         skeleton = build_skeleton(num_joints).to(device)
 
-    fps = DEFAULT_FPS
-    kwargs = {"skeleton": skeleton, "fps": fps}
-    metrics_list = [
-        FootSkateFromHeight(**kwargs),
-        FootSkateFromContacts(**kwargs),
-        FootContactConsistency(**kwargs),
-        FootSkateRatio(**kwargs),
-        ContraintFollow(**kwargs),
-        TMR_EmbeddingMetric(**kwargs),
-    ]
+    motion_fps = float(args.motion_fps if args.motion_fps is not None else args.fps)
+    gt_fps = float(args.gt_fps if args.gt_fps is not None else args.fps)
+    print(f"Using motion_fps={motion_fps} (gen pass), gt_fps={gt_fps} (GT pass) "
+          f"for geometric (foot-skate / contact) metrics.")
+
+    def _build_metrics(fps_val: float) -> list:
+        kw = {"skeleton": skeleton, "fps": fps_val}
+        return [
+            FootSkateFromHeight(**kw),
+            FootSkateFromContacts(**kw),
+            FootContactConsistency(**kw),
+            FootSkateRatio(**kw),
+            ContraintFollow(**kw),
+            TMR_EmbeddingMetric(**kw),
+        ]
+
+    metrics_list = _build_metrics(motion_fps)
+    metrics_list_gt = _build_metrics(gt_fps) if gt_fps != motion_fps else metrics_list
 
     groups = group_by_parent(examples)
     for group in tqdm(groups, desc="Evaluating folders"):
@@ -317,7 +380,8 @@ def main():
             aggregated_gt,
             tmr_metrics,
             tmr_per_sample,
-        ) = _run_eval_on_group(group, skeleton, metrics_list, device, group_name=folder_name, soma30_skel=soma30_skel)
+        ) = _run_eval_on_group(group, skeleton, metrics_list, device, group_name=folder_name,
+                               soma30_skel=soma30_skel, metrics_list_gt=metrics_list_gt)
 
         texts = []
         for sample_dir, _ in group:

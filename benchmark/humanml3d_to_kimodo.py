@@ -512,12 +512,31 @@ def _delta_rot_vel_from_alpha(alpha: torch.Tensor) -> torch.Tensor:
         r_rot_ang[1:] = cumsum(rot_vel[..., :-1])
     => rot_vel[t] = alpha[t+1] - alpha[t] for t in 0..T-2; rot_vel[T-1] = 0
        (unused in recovery).
-    Also wraps deltas into (-π, π] to handle the atan2 branch cut.
+
+    α here is a HALF angle: the quaternion (cos α, 0, sin α, 0) and
+    (-cos α, 0, -sin α, 0) — i.e. α and α + π — represent the *same* physical
+    rotation, so α extracted via ``atan2(quat_y, quat_w)`` has a ±π sign
+    ambiguity at adjacent frames whenever the matrix-to-quat extraction
+    picks opposite signs.  Likewise HumanML3D's own encoding stores rot_vel
+    as ``arcsin(half_angle)`` which is restricted to (-π/2, π/2]; raw
+    differences of extracted α can therefore exceed π/2 even though the true
+    motion is well within it.
+
+    The earlier "wrap to (-π, π]" via ``atan2(sin, cos)`` matches *full-angle*
+    quaternions, not the half-angle convention used here, so it left spurious
+    ±π jumps on ~5% of GT motions.  We unwrap with the correct period (π)
+    using ``torch.remainder`` (which matches Python's ``%`` and returns a
+    non-negative result for a positive divisor):
+
+        rot_vel = ((diff + π/2) mod π) - π/2   ∈ (-π/2, π/2]
+
+    This matches HML3D's encoded rot_vel range exactly and removes the
+    sign-flip artifact at the atan2 branch cut.
     """
+    import math
     rot_vel = torch.zeros_like(alpha)
     diff = alpha[1:] - alpha[:-1]
-    # Wrap to (-π, π]
-    diff = torch.atan2(torch.sin(diff), torch.cos(diff))
+    diff = torch.remainder(diff + 0.5 * math.pi, math.pi) - 0.5 * math.pi
     rot_vel[:-1] = diff
     return rot_vel
 

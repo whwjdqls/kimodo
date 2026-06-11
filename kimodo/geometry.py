@@ -27,18 +27,21 @@ def matrix_to_cont6d(matrix: torch.Tensor) -> torch.Tensor:
     return cont_6d
 
 
-def cont6d_to_matrix(cont6d: torch.Tensor) -> torch.Tensor:
-    """Convert 6D continuous representation to rotation matrix (Gram–Schmidt on two columns).
+def cont6d_to_matrix(cont6d: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Convert 6D continuous representation to rotation matrix (Gram-Schmidt on two columns).
 
-    Last dim must be 6.
+    Last dim must be 6. ``eps`` floors the Gram-Schmidt normalizations so the
+    backward pass stays finite when either ``x_raw`` is near zero or
+    ``y_raw`` is near-parallel to ``x_raw`` (the two degenerate cases that
+    blow up the ``1/||.||^2`` gradient term).
     """
     assert cont6d.shape[-1] == 6, "The last dimension must be 6"
     x_raw = cont6d[..., 0:3]
     y_raw = cont6d[..., 3:6]
 
-    x = x_raw / torch.norm(x_raw, dim=-1, keepdim=True)
+    x = x_raw / (torch.norm(x_raw, dim=-1, keepdim=True) + eps)
     z = torch.cross(x, y_raw, dim=-1)
-    z = z / torch.norm(z, dim=-1, keepdim=True)
+    z = z / (torch.norm(z, dim=-1, keepdim=True) + eps)
 
     y = torch.cross(z, x, dim=-1)
 

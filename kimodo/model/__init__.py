@@ -5,7 +5,7 @@
 from .common import resolve_target
 from .kimodo_model import Kimodo
 from .llm2vec import LLM2VecEncoder
-from .load_model import load_model
+from .load_model import load_model, load_model_from_dir
 from .loading import (
     AVAILABLE_MODELS,
     DEFAULT_MODEL,
@@ -22,6 +22,7 @@ __all__ = [
     "TMR",
     "TwostageDenoiser",
     "load_model",
+    "load_model_from_dir",
     "load_checkpoint_state_dict",
     "resolve_target",
     "AVAILABLE_MODELS",

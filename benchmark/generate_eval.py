@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 
 from kimodo.constraints import load_constraints_lst
 from kimodo.meta import parse_prompts_from_meta
-from kimodo.model import DEFAULT_MODEL, load_model
+from kimodo.model import DEFAULT_MODEL, load_model, load_model_from_dir
 from kimodo.tools import load_json, seed_everything
 
 
@@ -54,6 +54,14 @@ def parse_args():
         type=str,
         default=DEFAULT_MODEL,
         help="Name of the model (e.g. Kimodo-SOMA-RP-v1.1, kimodo-soma-rp, or SOMA).",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        default=None,
+        help="Path to a local model folder (config.yaml + model.safetensors + stats/) "
+        "to evaluate a custom training run, bypassing the model-name registry. "
+        "Takes precedence over --model. Build one with build_eval_model_folder.py.",
     )
     parser.add_argument(
         "--diffusion_steps",
@@ -219,26 +227,34 @@ def main():
         raise SystemExit(f"No folders with meta.json found under {testsuite_root}")
     print(f"Discovered {len(examples)} example folders.")
 
-    model, resolved_name = load_model(
-        args.model,
-        device=device,
-        default_family="Kimodo",
-        return_resolved_name=True,
-        text_encoder_fp32=args.text_encoder_fp32,
-    )
-    # v1.1 models are meant to be used for benchmark evaluation
-    _deprecated_for_benchmark = {
-        "kimodo-soma-rp-v1": "Kimodo-SOMA-RP-v1 was not trained to be compatible with the benchmark evaluation.",
-        "kimodo-soma-seed-v1": "Kimodo-SOMA-SEED-v1 is not the latest model for benchmark evaluation.",
-    }
-    if resolved_name in _deprecated_for_benchmark:
-        import warnings
-
-        warnings.warn(
-            f"Model '{args.model}' resolved to {resolved_name}: "
-            f"{_deprecated_for_benchmark[resolved_name]} Consider using v1.1.",
-            stacklevel=1,
+    if args.model_dir is not None:
+        model = load_model_from_dir(
+            args.model_dir,
+            device=device,
+            text_encoder_fp32=args.text_encoder_fp32,
         )
+        resolved_name = f"local:{Path(args.model_dir).name}"
+    else:
+        model, resolved_name = load_model(
+            args.model,
+            device=device,
+            default_family="Kimodo",
+            return_resolved_name=True,
+            text_encoder_fp32=args.text_encoder_fp32,
+        )
+        # v1.1 models are meant to be used for benchmark evaluation
+        _deprecated_for_benchmark = {
+            "kimodo-soma-rp-v1": "Kimodo-SOMA-RP-v1 was not trained to be compatible with the benchmark evaluation.",
+            "kimodo-soma-seed-v1": "Kimodo-SOMA-SEED-v1 is not the latest model for benchmark evaluation.",
+        }
+        if resolved_name in _deprecated_for_benchmark:
+            import warnings
+
+            warnings.warn(
+                f"Model '{args.model}' resolved to {resolved_name}: "
+                f"{_deprecated_for_benchmark[resolved_name]} Consider using v1.1.",
+                stacklevel=1,
+            )
     print(f"Generating with model: {resolved_name}")
     fps = model.fps
     default_diffusion_steps = args.diffusion_steps

@@ -1,0 +1,97 @@
+# BONES-SEED training config: 1:1:1 mixture of
+#   - natural full clips      (seed_metadata_v004.csv)
+#   - single timeline events  (seed_metadata_v002_temporal_labels.jsonl)
+#   - multi-timeline segments (multi_timeline.jsonl)
+#
+# Inherits defaults from default.yaml's structure; only data.* differs.
+
+# ----- data -----
+data:
+  kind: bones_seed
+  data_root: /home/jungbin_cho/seed/soma_uniform_motions_20fps
+  natural_csv_path: /home/jungbin_cho/seed/metadata/seed_metadata_v004.csv
+  temporal_labels_path: /home/jungbin_cho/seed/metadata/seed_metadata_v002_temporal_labels.jsonl
+  multi_timeline_path: /home/jungbin_cho/seed/multi_timeline.jsonl
+  train_split_path: /home/jungbin_cho/Kimodo-Motion-Gen-Benchmark/splits/train_split_paths.txt
+  fps: 20
+  min_frames: 10            # 0.5 s @ 20 fps — drop sub-second snippets
+  max_frames: 200           # padding cap for the collator (10 s @ 20 fps)
+  max_clip_sec: 10.0        # output clip cap (= max_frames / fps)
+  max_segment_sec: 15.0     # disregard source segments longer than this
+  rand_offset_max_sec: 2.0  # random start offset window when T >= max_clip_sec
+  include_mirrored: true
+  random_heading_aug: true
+  cache_index: ${output_dir}/bones_seed_index.json
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+
+# ----- model -----
+model_config_path: /home/jungbin_cho/Kimodo-SOMA-SEED-v1.1/config.yaml
+stats_path: /home/jungbin_cho/Kimodo-SOMA-SEED-v1.1/stats/motion/
+denoiser_fps_override: 20
+init_from_safetensors: null
+
+# ----- text encoder -----
+text_encoder:
+  type: llm2vec
+  device: auto
+  fp32: false
+
+# ----- training loop -----
+trainer:
+  output_dir: ${output_dir}
+  batch_size: 64
+  grad_accum: 1
+  num_steps: 500_000
+  lr: 2.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  warmup_steps: 1000
+  log_every: 50
+  ckpt_every: 5000
+  viz_every: 5000
+  eval_every: 0vscode-webview://14qm6i6ibj6qltrugp5duu3nlt6aelaqp57j5qdabh926qn1q0rk/kimodo_open/kimodo/scripts/train.py#L249-L306
+  text_drop_prob: 0.1
+  ema_decay: 0.995
+  ema_every: 10
+  mixed_precision: bf16
+  grad_clip: 0.5
+  resume_from: null
+  seed: 0
+  loss_weights:
+    smooth_root_pos: 10.0
+    global_root_heading: 2.0
+    local_joints_positions: 10.0
+    velocities: 3.0
+    global_rot_data: 10.0
+    foot_contacts: 4.0
+    fk: 5.0
+  smooth_l1_beta: 1.0
+  phase: text
+  constraint_weights:
+    none: 0.40
+    fullbody_keyframes: 0.20
+    fullbody_inbetween: 0.10
+    root_waypoints: 0.10
+    root_path: 0.10
+    ee_keyframes: 0.10
+
+# ----- visualization -----
+viz:
+  num_samples: 0
+  # prompts:
+  #   - "a person is walking forward."
+  #   - "a person is jumping in place."
+  num_frames: 100
+  num_denoising_steps: 50
+  cfg_weight: [2.0, 0.0]
+  cfg_scale: 2.5
+  save_videos: true
+  # GT-vs-generated side-by-side viz on held-out test motions.
+  test_vs_gt: true
+  test_split_file: /home/jungbin_cho/Kimodo-Motion-Gen-Benchmark/splits/test_content_split_paths_small.txt
+  num_test_samples: 4
+  test_max_frames: 200
+
+output_dir: /home/jungbin_cho/kimodo_open/runs/bones_seed

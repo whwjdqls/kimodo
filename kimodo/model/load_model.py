@@ -105,6 +105,56 @@ def _select_text_encoder_conf(text_encoder_url: str, text_encoder_fp32: bool = F
         return _build_local_text_encoder_conf(text_encoder_fp32)
 
 
+def load_model_from_dir(
+    model_path,
+    device=None,
+    eval_mode: bool = True,
+    text_encoder=None,
+    text_encoder_fp32: bool = False,
+):
+    """Load a Kimodo model directly from a local model folder.
+
+    Bypasses the model-name registry / HuggingFace resolution used by
+    :func:`load_model`, so it works for custom training runs that aren't
+    registered models. The folder must contain ``config.yaml`` (inference
+    config, i.e. a training run's ``model_config.yaml``), ``model.safetensors``,
+    and ``stats/`` — exactly the layout produced by ``build_eval_model_folder.py``.
+
+    The instantiation logic mirrors :func:`load_model` after path resolution.
+    """
+    model_path = Path(model_path)
+    model_config_path = model_path / "config.yaml"
+    if not model_config_path.exists():
+        raise FileNotFoundError(
+            f"config.yaml missing in model folder: {model_config_path}"
+        )
+
+    model_conf = OmegaConf.load(model_config_path)
+
+    if text_encoder is not None:
+        runtime_conf = OmegaConf.create({"checkpoint_dir": str(model_path)})
+    else:
+        text_encoder_url = get_env_var("TEXT_ENCODER_URL", DEFAULT_TEXT_ENCODER_URL)
+        runtime_conf = OmegaConf.create(
+            {
+                "checkpoint_dir": str(model_path),
+                "text_encoder": _select_text_encoder_conf(text_encoder_url, text_encoder_fp32),
+            }
+        )
+
+    model_cfg = OmegaConf.to_container(OmegaConf.merge(model_conf, runtime_conf), resolve=True)
+    model_cfg.pop("checkpoint_dir", None)
+    if text_encoder is not None:
+        model_cfg["text_encoder"] = None
+
+    model = instantiate_from_dict(model_cfg, overrides={"device": device})
+    if text_encoder is not None:
+        model.text_encoder = text_encoder
+    if eval_mode:
+        model = model.eval()
+    return model
+
+
 def load_model(
     modelname=None,
     device=None,

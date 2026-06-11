@@ -83,6 +83,19 @@ class Diffusion(torch.nn.Module):
         posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         self.register_buffer("posterior_variance", posterior_variance, persistent=False)
 
+        # Posterior-mean coefficients for x0-prediction DDPM sampling
+        # (Ho et al. 2020 eq. 7; MDM uses the same form). Given a model that
+        # outputs x̂₀, the DDPM reverse-step mean is
+        #     μ_q(x_t, x̂₀) = posterior_mean_coef1 · x̂₀ + posterior_mean_coef2 · x_t
+        # and the variance is ``posterior_variance``. We also stash a clipped
+        # log-variance for numerically-stable noise scaling at sample time.
+        posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        posterior_mean_coef2 = (1.0 - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1.0 - self.alphas_cumprod)
+        self.register_buffer("posterior_mean_coef1", posterior_mean_coef1, persistent=False)
+        self.register_buffer("posterior_mean_coef2", posterior_mean_coef2, persistent=False)
+        posterior_log_variance_clipped = torch.log(posterior_variance.clamp(min=1e-20))
+        self.register_buffer("posterior_log_variance_clipped", posterior_log_variance_clipped, persistent=False)
+
         sqrt_alphas_cumprod = torch.rsqrt(1.0 / self.alphas_cumprod)
         self.register_buffer("sqrt_alphas_cumprod", sqrt_alphas_cumprod, persistent=False)
 

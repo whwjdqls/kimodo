@@ -1,5 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Chain-reset forward kinematics for HumanML3D-in-kimodo features.
 
 This module exactly mirrors HumanML3D's ``Skeleton.forward_kinematics_cont6d``

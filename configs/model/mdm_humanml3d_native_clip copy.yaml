@@ -1,0 +1,43 @@
+# MDM-style one-stage denoiser on HumanML3D's NATIVE 263-D representation.
+#
+# Sibling to ``mdm_humanml3d_small_clip.yaml`` (which feeds kimodo's 273-D).
+# Only the motion_rep block differs: ``HumanML3DNativeMotionRep`` defines the
+# 263-D layout and the canonical bone offsets used by the FK loss.
+#
+# The transformer architecture is unchanged — same 8-layer / 4-head / dim
+# 512 backbone, same CLIP text encoder, same ``input_first_heading_angle:
+# false`` (HumanML3D's frame-0 canonicalization makes per-sample heading
+# conditioning a no-op).
+_target_: kimodo.model.Kimodo
+num_base_steps: 1000
+cfg_type: separated
+denoiser:
+  _target_: kimodo.model.onestage_denoiser.OnestageDenoiser
+  ckpt_path: ${oc.select:checkpoint_dir, null}/model.safetensors
+  motion_mask_mode: none
+  motion_rep:
+    _target_: kimodo.motion_rep.humanml3d_native.HumanML3DNativeMotionRep
+    fps: 20
+    mean_path: /home/jungbin_cho/HumanML3D/HumanML3D/Mean.npy
+    std_path: /home/jungbin_cho/HumanML3D/HumanML3D/Std.npy
+    canonical_joints_path: /home/jungbin_cho/HumanML3D/HumanML3D/new_joints/012314.npy
+    # MDM/MoMask trick: divide std on rot_velocity / lin_velocity / root_height /
+    # foot_contacts by feat_bias (=5), leaving ric_data / rot_data / local_velocity
+    # at /1. Up-weights root + contact blocks in the normalized loss.
+    feat_bias: 5.0
+    skeleton:
+      _target_: kimodo.skeleton.SMPLXSkeleton22
+  llm_shape:
+  - 1
+  - 512
+  use_text_mask: false
+  latent_dim: 512
+  ff_size: 1024
+  num_layers: 8
+  num_heads: 4
+  activation: gelu
+  dropout: 0.1
+  pe_dropout: 0.1
+  norm_first: false
+  num_text_tokens_override: 1
+  input_first_heading_angle: false
