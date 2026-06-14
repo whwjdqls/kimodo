@@ -38,7 +38,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -654,26 +654,37 @@ class ConstraintSampler:
         self,
         motion_rep,
         weights: Optional[Dict[str, float]] = None,
+        none_prob: float = 0.10,
+        mix_prob: float = 0.25,
+        max_keyframes: int = 20,
         seed: Optional[int] = None,
     ):
         self.motion_rep = motion_rep
         self.skeleton = motion_rep.skeleton
         if weights is None:
-            # Tunable distribution over constraint families.
+            # Per-family weights for the *constrained* draws. The paper samples
+            # patterns from this set; we use a uniform mix of the 5 families.
             weights = {
-                "none": 0.40,
-                "fullbody_keyframes": 0.20,
-                "fullbody_inbetween": 0.10,
-                "root_waypoints": 0.10,
-                "root_path": 0.10,
-                "ee_keyframes": 0.10,
+                "fullbody_keyframes": 0.20,        # (a) full-body pos+rot at sparse keyframes
+                "ee_keyframes": 0.20,              # (b) hands/feet pos+rot at sparse keyframes
+                "root_waypoints": 0.20,            # (c) 2D root pos/heading at sparse keyframes
+                "root_path": 0.20,                 # (d) 2D root pos/heading on a dense path
+                "foot_contacts_keyframes": 0.20,   # (e) foot-contact config at sparse keyframes
             }
+        # 'none' (text-only) and 'mix' (two patterns combined) are handled
+        # separately from the per-family weights, matching the paper curriculum:
+        #   none_prob fraction text-only, mix_prob fraction two-pattern,
+        #   the rest a single family. Defaults: 10% / 25% / 65%.
         self.weights = weights
+        self.none_prob = float(none_prob)
+        self.mix_prob = float(mix_prob)
+        self.max_keyframes = int(max_keyframes)
+        # Set by the training loop each step to step/num_steps; drives the linear
+        # 1 -> max_keyframes ramp for sparse-constraint keyframe counts.
+        self.progress = 0.0
         names = list(weights.keys())
         self._names = names
-        self._probs = np.asarray(
-            [float(weights[n]) for n in names], dtype=np.float64,
-        )
+        self._probs = np.asarray([float(weights[n]) for n in names], dtype=np.float64)
         self._probs = self._probs / self._probs.sum()
         self._rng = np.random.default_rng(seed)
 
@@ -683,6 +694,68 @@ class ConstraintSampler:
             torch.zeros_like(motion_norm),
         )
 
+    def _max_keyframes_now(self) -> int:
+        """Linearly ramp the max sparse-keyframe count from 1 to max_keyframes."""
+        p = min(max(float(self.progress), 0.0), 1.0)
+        return max(1, int(round(1.0 + (self.max_keyframes - 1) * p)))
+
+    def _sample_num_keyframes(self, L: int) -> int:
+        """Number of sparse keyframes, biased toward fewer (U**2), capped by length."""
+        M = min(self._max_keyframes_now(), L)
+        if M <= 1:
+            return 1
+        u = float(self._rng.random())
+        n = 1 + int((M - 1) * (u * u))  # squaring biases toward fewer keyframes
+        return int(max(1, min(n, L)))
+
+    def _idxs(self, L: int) -> list:
+        n = self._sample_num_keyframes(L)
+        return sorted(self._rng.choice(L, size=min(n, L), replace=False).tolist())
+
+    def _apply_family(self, family, observed, mask, motion_norm, b, L, sl):
+        sr_sl, head_sl, pos_sl, rot_sl, fc_sl = sl
+        if family == "fullbody_keyframes":
+            idxs = self._idxs(L)
+            observed[b, idxs, :] = motion_norm[b, idxs, :]
+            mask[b, idxs, :] = 1.0
+
+        elif family == "root_waypoints":
+            idxs = self._idxs(L)
+            observed[b, idxs, sr_sl] = motion_norm[b, idxs, sr_sl]
+            mask[b, idxs, sr_sl] = 1.0
+            if self._rng.random() < 0.5:  # sometimes also heading (path_2dposrot)
+                observed[b, idxs, head_sl] = motion_norm[b, idxs, head_sl]
+                mask[b, idxs, head_sl] = 1.0
+
+        elif family == "root_path":  # dense path — every valid frame
+            observed[b, :L, sr_sl] = motion_norm[b, :L, sr_sl]
+            mask[b, :L, sr_sl] = 1.0
+            if self._rng.random() < 0.5:
+                observed[b, :L, head_sl] = motion_norm[b, :L, head_sl]
+                mask[b, :L, head_sl] = 1.0
+
+        elif family == "foot_contacts_keyframes":
+            idxs = self._idxs(L)
+            observed[b, idxs, fc_sl] = motion_norm[b, idxs, fc_sl]
+            mask[b, idxs, fc_sl] = 1.0
+
+        elif family == "ee_keyframes":
+            idxs = self._idxs(L)
+            ee_names = list(_SOMA30_EE_JOINTS.keys())
+            k = int(self._rng.integers(1, len(ee_names) + 1))
+            chosen = self._rng.choice(ee_names, size=k, replace=False)
+            # Pin smooth_root_pos so EE positions have a defined world frame.
+            observed[b, idxs, sr_sl] = motion_norm[b, idxs, sr_sl]
+            mask[b, idxs, sr_sl] = 1.0
+            for jn in chosen:
+                jidx = _SOMA30_EE_JOINTS[jn]
+                p_start, p_end = pos_sl.start + jidx * 3, pos_sl.start + (jidx + 1) * 3
+                r_start, r_end = rot_sl.start + jidx * 6, rot_sl.start + (jidx + 1) * 6
+                observed[b, idxs, p_start:p_end] = motion_norm[b, idxs, p_start:p_end]
+                mask[b, idxs, p_start:p_end] = 1.0
+                observed[b, idxs, r_start:r_end] = motion_norm[b, idxs, r_start:r_end]
+                mask[b, idxs, r_start:r_end] = 1.0
+
     def __call__(
         self,
         motion_norm: torch.Tensor,
@@ -690,75 +763,83 @@ class ConstraintSampler:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """motion_norm: (B, T, D) normalized GT motion; lengths: (B,).
 
-        Returns observed_motion, motion_mask — both (B, T, D), normalized.
+        Per-sample curriculum (paper phase 2):
+          - none_prob fraction : text-only (no constraints)
+          - mix_prob fraction  : two distinct families unioned together
+          - remainder          : a single family
+        Sparse-keyframe counts ramp 1 -> max_keyframes over training, biased
+        toward fewer. Returns observed_motion, motion_mask — both (B, T, D).
         """
         B, T, D = motion_norm.shape
         observed, mask = self._zero_pair(motion_norm)
         mr = self.motion_rep
-        sr_sl = mr.slice_dict["smooth_root_pos"]
-        head_sl = mr.slice_dict["global_root_heading"]
-        pos_sl = mr.slice_dict["local_joints_positions"]
-        rot_sl = mr.slice_dict["global_rot_data"]
-        J = mr.nbjoints
-
+        sl = (
+            mr.slice_dict["smooth_root_pos"],
+            mr.slice_dict["global_root_heading"],
+            mr.slice_dict["local_joints_positions"],
+            mr.slice_dict["global_rot_data"],
+            mr.slice_dict["foot_contacts"],
+        )
+        n_fam = len(self._names)
         for b in range(B):
             L = int(lengths[b].item())
             if L <= 1:
                 continue
-            choice = self._names[self._rng.choice(len(self._names), p=self._probs)]
+            r = float(self._rng.random())
+            if r < self.none_prob:
+                continue  # text-only
+            if r < self.none_prob + self.mix_prob and n_fam >= 2:
+                fi = self._rng.choice(n_fam, size=2, replace=False, p=self._probs)
+                for f in fi:
+                    self._apply_family(self._names[int(f)], observed, mask, motion_norm, b, L, sl)
+            else:
+                f = int(self._rng.choice(n_fam, p=self._probs))
+                self._apply_family(self._names[f], observed, mask, motion_norm, b, L, sl)
 
-            if choice == "none":
-                continue
+        return observed, mask
 
-            if choice == "fullbody_keyframes":
-                n = int(self._rng.integers(1, min(5, L) + 1))
-                idxs = sorted(self._rng.choice(L, size=n, replace=False).tolist())
-                observed[b, idxs, :] = motion_norm[b, idxs, :]
-                mask[b, idxs, :] = 1.0
+    # Families with a clear spatial footprint to draw in the viz (foot_contacts
+    # has no positional marker, so it's left out of the visualization rotation).
+    VIZ_FAMILIES = ("root_path", "ee_keyframes", "fullbody_keyframes", "root_waypoints")
 
-            elif choice == "fullbody_inbetween":
-                # Just the first and last valid frame, full pose.
-                idxs = [0, L - 1] if L > 1 else [0]
-                observed[b, idxs, :] = motion_norm[b, idxs, :]
-                mask[b, idxs, :] = 1.0
+    def build_viz_constraints(
+        self,
+        motion_norm: torch.Tensor,
+        lengths: torch.Tensor,
+        families: List[str],
+        seed: int = 12345,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Deterministic, reproducible per-sample constraints for visualization.
 
-            elif choice == "root_waypoints":
-                n = int(self._rng.integers(2, min(8, L) + 1))
-                idxs = sorted(self._rng.choice(L, size=n, replace=False).tolist())
-                observed[b, idxs, sr_sl] = motion_norm[b, idxs, sr_sl]
-                mask[b, idxs, sr_sl] = 1.0
-                # Sometimes also constrain heading (path_2dposrot style).
-                if self._rng.random() < 0.5:
-                    observed[b, idxs, head_sl] = motion_norm[b, idxs, head_sl]
-                    mask[b, idxs, head_sl] = 1.0
-
-            elif choice == "root_path":
-                observed[b, :L, sr_sl] = motion_norm[b, :L, sr_sl]
-                mask[b, :L, sr_sl] = 1.0
-                if self._rng.random() < 0.5:
-                    observed[b, :L, head_sl] = motion_norm[b, :L, head_sl]
-                    mask[b, :L, head_sl] = 1.0
-
-            elif choice == "ee_keyframes":
-                n = int(self._rng.integers(1, min(4, L) + 1))
-                idxs = sorted(self._rng.choice(L, size=n, replace=False).tolist())
-                # Random subset of EE joints.
-                ee_names = list(_SOMA30_EE_JOINTS.keys())
-                k = int(self._rng.integers(1, len(ee_names) + 1))
-                chosen = self._rng.choice(ee_names, size=k, replace=False)
-                # Also pin smooth_root_pos at those frames so EE positions have
-                # a defined world frame (matches the constraint-object rule).
-                observed[b, idxs, sr_sl] = motion_norm[b, idxs, sr_sl]
-                mask[b, idxs, sr_sl] = 1.0
-                for jn in chosen:
-                    jidx = _SOMA30_EE_JOINTS[jn]
-                    p_start, p_end = pos_sl.start + jidx * 3, pos_sl.start + (jidx + 1) * 3
-                    r_start, r_end = rot_sl.start + jidx * 6, rot_sl.start + (jidx + 1) * 6
-                    observed[b, idxs, p_start:p_end] = motion_norm[b, idxs, p_start:p_end]
-                    mask[b, idxs, p_start:p_end] = 1.0
-                    observed[b, idxs, r_start:r_end] = motion_norm[b, idxs, r_start:r_end]
-                    mask[b, idxs, r_start:r_end] = 1.0
-
+        Unlike :meth:`__call__` (random, advances the shared training RNG, may
+        emit 'none'), this applies a *fixed* family to each batch item with a
+        private fixed-seed RNG and the full keyframe budget — so the viz is
+        reproducible across training steps and never empty, while the training
+        sampler's RNG / curriculum ``progress`` are left untouched. ``families[b]``
+        names the family for item ``b``. Returns ``(observed, mask)``, both
+        ``(B, T, D)`` in normalized feature space (same as ``__call__``).
+        """
+        B, T, D = motion_norm.shape
+        observed, mask = self._zero_pair(motion_norm)
+        mr = self.motion_rep
+        sl = (
+            mr.slice_dict["smooth_root_pos"],
+            mr.slice_dict["global_root_heading"],
+            mr.slice_dict["local_joints_positions"],
+            mr.slice_dict["global_rot_data"],
+            mr.slice_dict["foot_contacts"],
+        )
+        saved_rng, saved_progress = self._rng, self.progress
+        self._rng = np.random.default_rng(seed)
+        self.progress = 1.0  # full keyframe budget so the viz constraint is dense enough to read
+        try:
+            for b in range(B):
+                L = int(lengths[b].item())
+                if L <= 1:
+                    continue
+                self._apply_family(families[b % len(families)], observed, mask, motion_norm, b, L, sl)
+        finally:
+            self._rng, self.progress = saved_rng, saved_progress
         return observed, mask
 
 
@@ -1011,6 +1092,88 @@ def _cfg_sample(
     return cur
 
 
+# Fingertip-end / clutter joints dropped from the SOMASkeleton30 stick figure
+# (the user's "we don't need the hands (fingers)").
+_VIZ_DROP_JOINT_NAMES = (
+    "LeftHandThumbEnd", "LeftHandMiddleEnd",
+    "RightHandThumbEnd", "RightHandMiddleEnd",
+)
+
+
+def _viz_skip_joints(skeleton) -> List[int]:
+    """Joint indices to omit from the training stick-figure viz (fingertip ends)."""
+    bone_index = getattr(skeleton, "bone_index", {}) or {}
+    return [bone_index[n] for n in _VIZ_DROP_JOINT_NAMES if n in bone_index]
+
+
+def _constraint_markers_from_mask(
+    mask_1: torch.Tensor,        # (L, D) constraint mask for ONE sample
+    gt_joints: np.ndarray,       # (L, J, 3) GT world joints for that sample
+    motion_rep,
+    drop_joints: Optional[Sequence[int]] = None,
+) -> dict:
+    """Recover world-space constraint targets from a feature-space mask.
+
+    Constraints are sampled *from* the GT motion, so each constrained
+    (frame, joint) maps to the GT world joint at that frame. Returns
+    ``{"spheres": (K,3), "sphere_frames": (K,), "root_path": (P,3)|None,
+    "pause_frames": [int]}``:
+
+      - ``spheres`` / ``sphere_frames``: purple-sphere targets — full-body / EE
+        keyframe joints (at joint height) and *sparse* 2D root waypoints (on the
+        floor) — paired with the frame each is conditioned on.
+      - ``root_path``: a *dense* root path (every frame pinned), drawn as a line;
+        ``None`` when the root constraint is sparse (then it's a waypoint sphere).
+      - ``pause_frames``: the discrete keyframes to hold the video on.
+    """
+    sd = motion_rep.slice_dict
+    J = int(motion_rep.nbjoints)
+    if torch.is_tensor(mask_1):
+        mask_1 = mask_1.detach().cpu().numpy()
+    L = mask_1.shape[0]
+    drop = {int(j) for j in drop_joints} if drop_joints else set()
+
+    sphere_pts: List[np.ndarray] = []
+    sphere_frames: List[int] = []
+
+    # Full-body / end-effector keyframe joints -> spheres at joint height.
+    ljp = sd["local_joints_positions"]
+    ljp_mask = mask_1[:, ljp].reshape(L, J, 3)
+    active = ljp_mask.any(axis=-1)  # (L, J)
+    fa, ja = np.where(active)
+    for f, j in zip(fa.tolist(), ja.tolist()):
+        if j in drop or j >= gt_joints.shape[1]:
+            continue
+        sphere_pts.append(gt_joints[f, j])
+        sphere_frames.append(int(f))
+
+    # Root constraint: dense path (line) vs sparse waypoints (floor spheres).
+    sr = sd["smooth_root_pos"]
+    rf = np.where(mask_1[:, sr].any(axis=-1))[0]
+    root_path = None
+    if len(rf) >= L and len(rf) > 0:                 # every frame pinned -> dense path
+        root_path = gt_joints[rf, 0].astype(np.float32)
+    elif len(rf):                                    # sparse -> waypoint spheres on the floor
+        for f in rf.tolist():
+            wp = gt_joints[f, 0].copy()
+            wp[1] = 0.0
+            sphere_pts.append(wp)
+            sphere_frames.append(int(f))
+
+    spheres = (
+        np.asarray(sphere_pts, dtype=np.float32) if sphere_pts
+        else np.zeros((0, 3), np.float32)
+    )
+    sphere_frames_arr = np.asarray(sphere_frames, dtype=np.int64)
+    pause_frames = sorted({int(f) for f in sphere_frames})
+    return {
+        "spheres": spheres,
+        "sphere_frames": sphere_frames_arr,
+        "root_path": root_path,
+        "pause_frames": pause_frames,
+    }
+
+
 @torch.no_grad()
 def viz_step(
     denoiser: nn.Module,
@@ -1023,6 +1186,7 @@ def viz_step(
     test_examples: Optional[List[dict]] = None,
     extra_prompts: Optional[List[str]] = None,
     tb_writer=None,
+    constraint_sampler: Optional["ConstraintSampler"] = None,
 ) -> None:
     """Unified per-step viz: writes ``<out_dir>/<step:07d>/<i>_<id>.{npz,mp4}``.
 
@@ -1102,6 +1266,25 @@ def viz_step(
     raw.train()
 
     joint_parents = motion_rep.skeleton.joint_parents.cpu().numpy().tolist()
+    skip_joints = _viz_skip_joints(motion_rep.skeleton)  # drop fingertip ends
+
+    def _tb_add(tag: str, stack: List[np.ndarray]) -> None:
+        if tb_writer is None or not stack:
+            return
+        Tmax = max(v.shape[0] for v in stack)
+        H, W = stack[0].shape[1:3]
+        vids = np.zeros((len(stack), Tmax, 3, H, W), dtype=np.float32)
+        for n, v in enumerate(stack):
+            vt = np.transpose(v, (0, 3, 1, 2)).astype(np.float32) / 255.0
+            vids[n, : vt.shape[0]] = vt
+            if vt.shape[0] < Tmax:
+                vids[n, vt.shape[0]:] = vt[-1]
+        try:
+            tb_writer.add_video(tag, torch.from_numpy(vids), global_step=step, fps=fps)
+        except Exception as e:
+            log.warning("TensorBoard add_video failed (%s); skipping.", e)
+
+    # ---- text -> motion (no constraints) ----
     video_stack: List[np.ndarray] = []
     for i, it in enumerate(items):
         L = it["length"]
@@ -1126,6 +1309,7 @@ def viz_step(
         try:
             frames = render_sidebyside(
                 gt_joints, gen_joints, joint_parents, caption=it["caption"],
+                skip_joints=skip_joints,
             )
         except Exception as e:
             log.warning("Render failed for %s: %s", it["id"], e)
@@ -1139,21 +1323,156 @@ def viz_step(
             log.warning("MP4 write failed for %s: %s", it["id"], e)
         video_stack.append(frames)
 
-    if tb_writer is not None and video_stack:
-        Tmax = max(v.shape[0] for v in video_stack)
-        H, W = video_stack[0].shape[1:3]
-        vids = np.zeros((len(video_stack), Tmax, 3, H, W), dtype=np.float32)
-        for n, v in enumerate(video_stack):
-            vt = np.transpose(v, (0, 3, 1, 2)).astype(np.float32) / 255.0
-            vids[n, : vt.shape[0]] = vt
-            if vt.shape[0] < Tmax:
-                vids[n, vt.shape[0]:] = vt[-1]
-        try:
-            tb_writer.add_video("viz", torch.from_numpy(vids), global_step=step, fps=fps)
-        except Exception as e:
-            log.warning("TensorBoard add_video failed (%s); skipping.", e)
+    _tb_add("viz", video_stack)
 
-    log.info("Wrote %d viz samples to %s", len(items), step_dir)
+    # ---- text + constraints -> motion (phase-2 only) ----
+    n_constrained = 0
+    if constraint_sampler is not None:
+        n_constrained = _viz_constrained_pass(
+            raw, diffusion, motion_rep, text_encoder, device,
+            items=items, step_dir=step_dir, joint_parents=joint_parents,
+            skip_joints=skip_joints, constraint_sampler=constraint_sampler,
+            n_steps=n_steps, cfg_scale=cfg_scale, fps=fps, save_mp4=save_mp4,
+            tb_add=_tb_add,
+        )
+
+    log.info(
+        "Wrote %d viz samples (+%d constrained) to %s",
+        len(items), n_constrained, step_dir,
+    )
+
+
+@torch.no_grad()
+def _viz_constrained_pass(
+    raw: nn.Module,
+    diffusion: Diffusion,
+    motion_rep,
+    text_encoder,
+    device: torch.device,
+    *,
+    items: List[dict],
+    step_dir: Path,
+    joint_parents: list,
+    skip_joints: List[int],
+    constraint_sampler: "ConstraintSampler",
+    n_steps: int,
+    cfg_scale: float,
+    fps: int,
+    save_mp4: bool,
+    tb_add,
+) -> int:
+    """Generate + render ``text + constraints -> motion`` for the GT viz examples.
+
+    For each held-out example a deterministic constraint (cycled across
+    :pyattr:`ConstraintSampler.VIZ_FAMILIES`) is drawn from the GT motion, the
+    denoiser is sampled with that ``observed``/``motion_mask`` conditioning, and
+    the result is rendered side-by-side with the GT — both panels overlaid with
+    the constraint targets so you can see whether the generation satisfies them.
+    Output files get a ``_constrained`` suffix. Returns the number rendered.
+    """
+    import imageio.v3 as iio
+    from kimodo.scripts.render_soma import render_sidebyside
+
+    cons_items = [it for it in items if it["gt_features"] is not None]
+    if not cons_items:
+        return 0
+
+    D = motion_rep.motion_rep_dim
+    lengths_c = [min(int(it["length"]), int(it["gt_features"].shape[0])) for it in cons_items]
+    Bc = len(cons_items)
+    max_Tc = int(max(lengths_c))
+
+    motion_norm = torch.zeros(Bc, max_Tc, D, device=device)
+    gt_world: List[np.ndarray] = []
+    for i, it in enumerate(cons_items):
+        L = lengths_c[i]
+        gt_feats = torch.from_numpy(it["gt_features"]).to(device).float()[:L]  # (L, D) unnormalized
+        motion_norm[i, :L] = motion_rep.normalize(gt_feats)
+        gt_out = motion_rep.inverse(gt_feats.unsqueeze(0), is_normalized=False, return_numpy=False)
+        gt_world.append(gt_out["posed_joints"][0].cpu().numpy())  # (L, J, 3)
+
+    families = [
+        ConstraintSampler.VIZ_FAMILIES[i % len(ConstraintSampler.VIZ_FAMILIES)]
+        for i in range(Bc)
+    ]
+    lengths_t = torch.tensor(lengths_c, device=device)
+    observed, motion_mask = constraint_sampler.build_viz_constraints(
+        motion_norm, lengths_t, families,
+    )
+
+    captions = [it["caption"] for it in cons_items]
+    text_feat, text_pad_mask = encode_texts(text_encoder, captions, device)
+    pad_mask = torch.zeros(Bc, max_Tc, dtype=torch.bool, device=device)
+    for i, L in enumerate(lengths_c):
+        pad_mask[i, :L] = True
+    first_heading = torch.tensor(
+        [float(it["first_heading"]) for it in cons_items], dtype=torch.float32, device=device,
+    )
+
+    raw.eval()
+    cur = _cfg_sample(
+        raw, diffusion,
+        text_feat=text_feat, text_pad_mask=text_pad_mask,
+        pad_mask=pad_mask, first_heading=first_heading,
+        motion_mask=motion_mask, observed=observed,
+        n_steps=n_steps, cfg_scale=cfg_scale, device=device,
+    )  # (Bc, max_Tc, D) normalized
+    raw.train()
+
+    stack: List[np.ndarray] = []
+    n_done = 0
+    for i, it in enumerate(cons_items):
+        L = lengths_c[i]
+        gen_feats = cur[i:i + 1, :L].float()
+        gen_out = motion_rep.inverse(gen_feats, is_normalized=True, return_numpy=False)
+        gen_joints = gen_out["posed_joints"][0].cpu().numpy()
+        gen_dict = {
+            k: (v[0].cpu().numpy() if torch.is_tensor(v) else v)
+            for k, v in gen_out.items()
+        }
+        markers = _constraint_markers_from_mask(
+            motion_mask[i, :L], gt_world[i], motion_rep, drop_joints=skip_joints,
+        )
+        fam = families[i]
+        base = step_dir / f"{i:02d}_{it['id']}_constrained"
+        np.savez(
+            base.with_suffix(".npz"), **gen_dict, prompt=it["caption"],
+            constraint_family=fam,
+            spheres=markers["spheres"],
+            sphere_frames=markers["sphere_frames"],
+            pause_frames=np.asarray(markers["pause_frames"], dtype=np.int64),
+            root_path=(markers["root_path"] if markers["root_path"] is not None
+                       else np.zeros((0, 3), np.float32)),
+        )
+        if not save_mp4:
+            n_done += 1
+            continue
+        # Hold ~1 s on each conditioned keyframe so the viewer can judge whether
+        # the generation lands on the (highlighted) target.
+        pause_repeat = int(round(fps * 1.0))
+        try:
+            frames = render_sidebyside(
+                gt_world[i], gen_joints, joint_parents,
+                caption=f"{it['caption']}  [+{fam}]",
+                skip_joints=skip_joints,
+                gt_constraints=markers, gen_constraints=markers,
+                pause_repeat=pause_repeat,
+            )
+        except Exception as e:
+            log.warning("Constrained render failed for %s: %s", it["id"], e)
+            continue
+        try:
+            iio.imwrite(
+                str(base.with_suffix(".mp4")), frames,
+                fps=float(fps), codec="h264", plugin="pyav",
+            )
+        except Exception as e:
+            log.warning("Constrained MP4 write failed for %s: %s", it["id"], e)
+        stack.append(frames)
+        n_done += 1
+
+    tb_add("viz_constrained", stack)
+    return n_done
 
 
 @torch.no_grad()
@@ -1431,9 +1750,16 @@ def main() -> None:
         constraint_sampler = ConstraintSampler(
             motion_rep,
             weights=OmegaConf.to_container(cw) if cw is not None else None,
+            none_prob=float(cfg.trainer.get("constraint_none_prob", 0.10)),
+            mix_prob=float(cfg.trainer.get("constraint_mix_prob", 0.25)),
+            max_keyframes=int(cfg.trainer.get("constraint_max_keyframes", 20)),
             seed=int(cfg.trainer.seed) + 7 * env.rank,
         )
-        log.info("Phase 2: constraint sampler active with weights %s", constraint_sampler.weights)
+        log.info(
+            "Phase 2: constraint sampler active | none=%.2f mix=%.2f max_kf=%d weights=%s",
+            constraint_sampler.none_prob, constraint_sampler.mix_prob,
+            constraint_sampler.max_keyframes, constraint_sampler.weights,
+        )
     else:
         log.info("Phase 1: text-only training (no constraints).")
 
@@ -1486,6 +1812,7 @@ def main() -> None:
                 output_dir / "viz",
                 test_examples=test_examples,
                 tb_writer=tb_writer,
+                constraint_sampler=constraint_sampler,
             )
         except Exception as e:
             log.warning("Viz failed at step %d: %s", at_step, e)
@@ -1513,6 +1840,9 @@ def main() -> None:
         for batch in loader:
             step_t0 = time.time()
             optimizer.zero_grad(set_to_none=True)
+            # Phase-2 keyframe schedule: ramp max sparse keyframes 1 -> 20 over training.
+            if constraint_sampler is not None:
+                constraint_sampler.progress = step / max(1, num_steps)
             agg_loss: Dict[str, float] = {}
             for _accum in range(grad_accum):
                 losses = train_one_step(

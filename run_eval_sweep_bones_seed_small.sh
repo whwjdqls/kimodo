@@ -15,9 +15,10 @@ cd /home/jungbin_cho/kimodo_open
 STEPS=(20000 40000 60000 80000 100000 150000 200000 250000)
 RUN_DIR=/home/jungbin_cho/kimodo_open/runs/bones_seed_small
 TS=/home/jungbin_cho/Kimodo-Motion-Gen-Benchmark-20fps/testsuite
-SWEEP=/home/jungbin_cho/kimodo_eval_gen/BS-Small-sweep
-RESULTS=${SWEEP}/results
-MODELS=/home/jungbin_cho/kimodo_eval_models/BS-Small-sweep
+# Eval artifacts live under the model's run dir: runs/<model>/eval/{models,gen,results}/step_<N>
+EVAL_DIR=${RUN_DIR}/eval
+RESULTS=${EVAL_DIR}/results
+MODELS=${EVAL_DIR}/models
 SPLITS=(content repetition)
 CATS=(overview timeline_single timeline_multi)
 mkdir -p "${RESULTS}" "${MODELS}"
@@ -39,7 +40,7 @@ for s in "${STEPS[@]}"; do
     SP=$(printf "%07d" "$s")
     CKPT="ckpt_step${SP}.pt"
     MODEL_DIR="${MODELS}/step_${s}"
-    GEN_ROOT="${SWEEP}/step_${s}"
+    GEN_ROOT="${EVAL_DIR}/gen/step_${s}"
     RES_DIR="${RESULTS}/step_${s}"
 
     # ---- resume: skip if all 6 result JSONs already present ----
@@ -108,5 +109,5 @@ for s in "${STEPS[@]}"; do
 done
 
 log "================ all steps done; aggregating ================"
-python aggregate_sweep_curve.py "${RESULTS}" --out "${SWEEP}/sweep_curve" || log "aggregation failed"
+python aggregate_sweep_curve.py "${RESULTS}" --out "${EVAL_DIR}/sweep_curve" || log "aggregation failed"
 log "sweep complete."

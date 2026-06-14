@@ -1,13 +1,9 @@
 #!/bin/bash
-# Slurm ARRAY version of the bones_seed_small eval sweep: one checkpoint per array
-# task, run concurrently. Each task = build(fps20) -> generate -> embed(20->30) ->
-# evaluate(--fps 20) -> copy JSONs -> ERASE the ~12GB gen folder.
-# Generation uses --batch_size 256 (smoke-tested: 27.6GB peak on a 40GB A100 at
-# worst-case T=200). All 8 checkpoints are (re)done at this batch size so the whole
-# curve is consistent (batch size changes per-sample init noise; metrics are
-# statistically equivalent but not bit-identical across batch sizes).
-# Resumable: a task whose result JSONs already exist exits immediately.
-#SBATCH --job-name=BSsm_sweep
+# Evaluate ONE bones_seed_small checkpoint. Submit one of these per checkpoint
+# (independent single-GPU jobs schedule/backfill better than an array):
+#   for s in 20000 40000 ... ; do sbatch --job-name=BSsm_$((s/1000))k submit_eval_one_checkpoint.sh $s; done
+# Pipeline: build(fps20) -> generate(bs256) -> embed(20->30) -> evaluate(--fps20)
+#           -> copy JSONs -> ERASE the ~12GB gen folder. Resumable: exits if results exist.
 #SBATCH --partition=a2
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -15,20 +11,18 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
-#SBATCH --array=0-7%4
-#SBATCH --output=/home/jungbin_cho/kimodo_open/runs/bones_seed_small/eval/logs/sweep_array_%A_%a.log
-#SBATCH --error=/home/jungbin_cho/kimodo_open/runs/bones_seed_small/eval/logs/sweep_array_%A_%a.err
+#SBATCH --output=/home/jungbin_cho/kimodo_open/runs/bones_seed_small/eval/logs/%x_%j.log
+#SBATCH --error=/home/jungbin_cho/kimodo_open/runs/bones_seed_small/eval/logs/%x_%j.err
 
 set -uo pipefail
+s="${1:?usage: sbatch submit_eval_one_checkpoint.sh <STEP>}"
+
 source /home/jungbin_cho/miniconda3/etc/profile.d/conda.sh
 conda activate kimodo
 cd /home/jungbin_cho/kimodo_open
 
-STEPS=(20000 40000 60000 80000 100000 150000 200000 250000)
-s=${STEPS[$SLURM_ARRAY_TASK_ID]}
 SP=$(printf "%07d" "$s")
 CKPT="ckpt_step${SP}.pt"
-
 RUN_DIR=/home/jungbin_cho/kimodo_open/runs/bones_seed_small
 TS=/home/jungbin_cho/Kimodo-Motion-Gen-Benchmark-20fps/testsuite
 # Eval artifacts live under the model's run dir: runs/<model>/eval/{models,gen,results,logs}/step_<N>
@@ -40,7 +34,7 @@ SPLITS=(content repetition)
 CATS=(overview timeline_single timeline_multi)
 
 log() { echo "[$(date '+%F %T')] [step ${s}] $*"; }
-log "array task ${SLURM_ARRAY_TASK_ID} on $(hostname), GPUs=${CUDA_VISIBLE_DEVICES:-none}, ckpt=${CKPT}"
+log "job ${SLURM_JOB_ID:-local} on $(hostname), GPUs=${CUDA_VISIBLE_DEVICES:-none}, ckpt=${CKPT}"
 
 # ---- resume guard ----
 have=1
@@ -55,7 +49,7 @@ t0=$(date +%s)
 python build_eval_model_folder.py --run-dir "${RUN_DIR}" --ckpt "${CKPT}" \
     --out "${MODEL_DIR}" --fps 20 || { log "BUILD FAILED"; exit 1; }
 
-# ---- [2] generate (content + repetition) ----
+# ---- [2] generate (content + repetition), bs=256 ----
 for split in "${SPLITS[@]}"; do
     log "generate ${split}"
     python benchmark/generate_eval.py \
@@ -63,7 +57,7 @@ for split in "${SPLITS[@]}"; do
         --output "${GEN_ROOT}/${split}/text2motion" \
         --model-dir "${MODEL_DIR}" \
         --batch_size 256 --num_workers 8 --diffusion_steps 100 \
-        || { log "GENERATE ${split} FAILED (leaving gen dir for inspection)"; exit 1; }
+        || { log "GENERATE ${split} FAILED (leaving gen dir)"; exit 1; }
 done
 
 # ---- [3] embed (TMR, resample 20->30) ----
@@ -93,8 +87,7 @@ if [ "$copyok" = "1" ]; then
     rm -rf "${GEN_ROOT}" "${MODEL_DIR}"
     log "erased gen+model dirs (results in ${RES_DIR})"
 else
-    log "NOT erasing (missing JSONs) -> ${GEN_ROOT}"
-    exit 1
+    log "NOT erasing (missing JSONs) -> ${GEN_ROOT}"; exit 1
 fi
 
 dt=$(( $(date +%s) - t0 ))

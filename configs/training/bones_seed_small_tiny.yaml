@@ -69,13 +69,17 @@ trainer:
     fk: 5.0 #5.0
   smooth_l1_beta: 1.0
   phase: text
+  # Phase-2 constraint curriculum (paper: 10% none / 25% two-pattern mix / 65% single;
+  # sparse keyframes ramp 1 -> constraint_max_keyframes, biased to fewer).
+  constraint_none_prob: 0.10
+  constraint_mix_prob: 0.25
+  constraint_max_keyframes: 20
   constraint_weights:
-    none: 0.40
     fullbody_keyframes: 0.20
-    fullbody_inbetween: 0.10
-    root_waypoints: 0.10
-    root_path: 0.10
-    ee_keyframes: 0.10
+    ee_keyframes: 0.20
+    root_waypoints: 0.20
+    root_path: 0.20
+    foot_contacts_keyframes: 0.20
 
 # ----- visualization -----
 viz:

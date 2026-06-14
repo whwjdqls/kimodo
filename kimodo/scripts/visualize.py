@@ -105,6 +105,9 @@ VIEW_PRESETS: dict[str, dict] = {
     "front": dict(offset=(0.0, 1.8, 4.5), look_at_height=1.2, up=(0.0, 1.0, 0.0)),
 }
 
+# Vertical FOV shared by the renderer and the fixed-camera framing solver.
+_YFOV = np.pi / 4.5
+
 
 def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     """Right-handed look-at matrix in pyrender (OpenGL) convention: -Z forward, +Y up."""
@@ -128,6 +131,144 @@ def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     pose[:3, 2] = -fwd
     pose[:3, 3] = eye
     return pose
+
+
+# -----------------------------------------------------------------------------
+# Constraint overlay + fixed (non-tracking) camera
+# -----------------------------------------------------------------------------
+# Per-end-effector marker colors (RGBA). Anything not listed uses EE_DEFAULT.
+_EE_COLORS = {
+    "LeftHand": (235, 70, 70, 255),
+    "RightHand": (70, 120, 235, 255),
+    "LeftFoot": (70, 205, 95, 255),
+    "RightFoot": (225, 90, 205, 255),
+}
+_EE_DEFAULT = (235, 70, 70, 255)
+_ROOT_COLOR = (245, 165, 45, 255)      # root 2D path (orange)
+_FULLBODY_COLOR = (70, 200, 200, 255)  # full-body keyframe ghost joints (cyan)
+
+
+def _sphere(center, radius: float, color_rgba) -> trimesh.Trimesh:
+    m = trimesh.creation.icosphere(subdivisions=2, radius=radius)
+    m.apply_translation(np.asarray(center, dtype=np.float64))
+    m.visual.vertex_colors = np.tile(np.asarray(color_rgba, dtype=np.uint8), (len(m.vertices), 1))
+    return m
+
+
+def _cylinder_between(p0, p1, radius: float, color_rgba):
+    """A capsule-free cylinder spanning p0->p1 (used for root-path segments)."""
+    p0 = np.asarray(p0, dtype=np.float64)
+    p1 = np.asarray(p1, dtype=np.float64)
+    seg = p1 - p0
+    length = float(np.linalg.norm(seg))
+    if length < 1e-6:
+        return None
+    m = trimesh.creation.cylinder(radius=radius, height=length, sections=12)
+    # cylinder is +Z aligned & origin-centered; rotate +Z onto the segment direction.
+    z = np.array([0.0, 0.0, 1.0])
+    d = seg / length
+    axis = np.cross(z, d)
+    s = float(np.linalg.norm(axis))
+    c = float(np.dot(z, d))
+    transform = np.eye(4)
+    if s < 1e-8:
+        if c < 0:  # antiparallel: flip about X
+            transform[:3, :3] = trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])[:3, :3]
+    else:
+        transform[:3, :3] = trimesh.transformations.rotation_matrix(np.arctan2(s, c), axis / s)[:3, :3]
+    transform[:3, 3] = (p0 + p1) / 2.0
+    m.apply_transform(transform)
+    m.visual.vertex_colors = np.tile(np.asarray(color_rgba, dtype=np.uint8), (len(m.vertices), 1))
+    return m
+
+
+def build_constraint_meshes(constraints_lst, skeleton, start: int, end: int):
+    """Turn loaded constraint sets into a single colored trimesh of world-fixed markers.
+
+    Returns ``(combined_trimesh_or_None, marker_points (P,3))``. Markers:
+      * root2d        -> orange spheres on the floor (y~0) + connecting path tube
+      * end-effector  -> per-joint colored spheres at the target EE positions
+      * fullbody      -> small cyan spheres at every target joint (ghost pose)
+    Only keyframes whose frame index falls in [start, end) are drawn.
+    """
+    meshes: list[trimesh.Trimesh] = []
+    pts: list[list[float]] = []
+    for c in constraints_lst:
+        name = getattr(c, "name", "")
+        fi = c.frame_indices.detach().cpu().numpy().astype(int)
+        keep = (fi >= start) & (fi < end)
+        if name == "root2d":
+            xz = c.smooth_root_2d.detach().cpu().numpy()
+            order = np.argsort(fi)
+            path = []
+            for k in order:
+                if not keep[k]:
+                    continue
+                p = [float(xz[k, 0]), 0.04, float(xz[k, 1])]
+                path.append(p)
+                pts.append(p)
+                meshes.append(_sphere(p, 0.06, _ROOT_COLOR))
+            for a, b in zip(path[:-1], path[1:]):
+                seg = _cylinder_between(a, b, 0.02, _ROOT_COLOR)
+                if seg is not None:
+                    meshes.append(seg)
+        elif name == "fullbody":
+            gp = c.global_joints_positions.detach().cpu().numpy()  # (N, J, 3)
+            for k in range(len(fi)):
+                if not keep[k]:
+                    continue
+                for j in range(gp.shape[1]):
+                    p = gp[k, j].tolist()
+                    pts.append(p)
+                    meshes.append(_sphere(p, 0.035, _FULLBODY_COLOR))
+        else:  # end-effector family (end-effector / left-hand / right-foot / ...)
+            gp = c.global_joints_positions.detach().cpu().numpy()  # (N, J, 3)
+            # Mark only the NAMED end-effectors (e.g. LeftHand/RightHand), not the
+            # full expanded sub-chain that pos_indices covers (which is ~50 joints).
+            jnames = getattr(c, "joint_names", None)
+            if jnames:
+                ee_targets = [
+                    (skeleton.bone_index[n], _EE_COLORS.get(n, _EE_DEFAULT))
+                    for n in jnames if n in skeleton.bone_index
+                ]
+            else:
+                ee_targets = [(int(j), _EE_DEFAULT) for j in c.pos_indices.detach().cpu().numpy()]
+            for k in range(len(fi)):
+                if not keep[k]:
+                    continue
+                for j, col in ee_targets:
+                    p = gp[k, int(j)].tolist()
+                    pts.append(p)
+                    meshes.append(_sphere(p, 0.07, col))
+    if not meshes:
+        return None, np.zeros((0, 3), dtype=np.float64)
+    combined = trimesh.util.concatenate(meshes)
+    return combined, np.asarray(pts, dtype=np.float64)
+
+
+def compute_fixed_camera_pose(preset: dict, frame_points: np.ndarray, marker_points: np.ndarray,
+                              yfov: float, aspect: float, margin: float = 1.25) -> np.ndarray:
+    """One static camera pose that frames the whole motion (+ constraint markers).
+
+    Uses the preset's offset only as a *direction*; distance is solved so the
+    bounding sphere of all points fits the (smaller of vertical/horizontal) FOV.
+    The camera then does NOT track the root, so the floor stays put and the
+    character translates across it.
+    """
+    pts = frame_points.reshape(-1, 3)
+    if marker_points.size:
+        pts = np.concatenate([pts, marker_points], axis=0)
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    center = (mn + mx) / 2.0
+    radius = max(float(np.linalg.norm(pts - center, axis=1).max()), 1.0)
+    hfov = 2.0 * np.arctan(np.tan(yfov / 2.0) * aspect)
+    half = min(yfov, hfov) / 2.0
+    dist = radius / max(np.sin(half), 1e-3) * margin
+    direction = np.asarray(preset["offset"], dtype=np.float64)
+    direction /= max(np.linalg.norm(direction), 1e-9)
+    eye = center + direction * dist
+    return look_at(eye, center, np.asarray(preset["up"], dtype=np.float64))
 
 
 def compute_skinned_vertices(
@@ -189,6 +330,7 @@ def build_static_scene(
     initial_vertices: np.ndarray,
     faces: np.ndarray,
     body_color=(152, 189, 255, 255),
+    constraint_mesh: "trimesh.Trimesh | None" = None,
 ) -> tuple[pyrender.Scene, pyrender.Node]:
     scene = pyrender.Scene(
         bg_color=(0.92, 0.94, 0.97, 1.0),
@@ -198,6 +340,10 @@ def build_static_scene(
     # Checker floor at y=0 so motion is easy to read.
     ground_tm = _make_checker_floor(half_extent=20.0, tiles=40)
     scene.add(pyrender.Mesh.from_trimesh(ground_tm, smooth=False))
+
+    # World-fixed constraint markers (added once; they don't move).
+    if constraint_mesh is not None:
+        scene.add(pyrender.Mesh.from_trimesh(constraint_mesh, smooth=True))
 
     # Character mesh node (we'll swap it out each frame).
     char_tm = trimesh.Trimesh(vertices=initial_vertices, faces=faces, process=False)
@@ -224,12 +370,26 @@ def render_motion(
     preset: dict,
     width: int,
     height: int,
+    camera_mode: str = "follow",
+    fixed_cam_pose: "np.ndarray | None" = None,
+    constraint_mesh: "trimesh.Trimesh | None" = None,
 ) -> list[np.ndarray]:
-    scene, char_node = build_static_scene(verts_all[0], faces)
+    """Render frames.
 
-    yfov = np.pi / 4.5
+    camera_mode:
+      * "follow" (default): camera tracks the root XZ each frame -> character
+        stays centered, floor appears to slide (original behavior).
+      * "fixed": one static camera (``fixed_cam_pose``) frames the whole clip ->
+        the floor stays put and the character moves across it. Required to read
+        world-fixed constraint markers correctly.
+    """
+    scene, char_node = build_static_scene(verts_all[0], faces, constraint_mesh=constraint_mesh)
+
+    yfov = _YFOV
     cam = pyrender.PerspectiveCamera(yfov=yfov, znear=0.05, zfar=200.0)
     cam_node = scene.add(cam, pose=np.eye(4))
+    if camera_mode == "fixed" and fixed_cam_pose is not None:
+        scene.set_pose(cam_node, fixed_cam_pose)
 
     renderer = pyrender.OffscreenRenderer(viewport_width=width, viewport_height=height)
     render_flags = pyrender.RenderFlags.SHADOWS_DIRECTIONAL
@@ -248,10 +408,11 @@ def render_motion(
             scene.remove_node(char_node)
             char_node = scene.add(pyrender.Mesh.from_trimesh(char_tm, smooth=True))
 
-            rx, rz = float(root_xz_per_frame[t, 0]), float(root_xz_per_frame[t, 1])
-            target = np.array([rx, look_h, rz])
-            eye = np.array([rx + offset[0], offset[1], rz + offset[2]])
-            scene.set_pose(cam_node, look_at(eye, target, up_hint))
+            if camera_mode != "fixed":
+                rx, rz = float(root_xz_per_frame[t, 0]), float(root_xz_per_frame[t, 1])
+                target = np.array([rx, look_h, rz])
+                eye = np.array([rx + offset[0], offset[1], rz + offset[2]])
+                scene.set_pose(cam_node, look_at(eye, target, up_hint))
 
             color, _ = renderer.render(scene, flags=render_flags)
             frames.append(color)
@@ -289,6 +450,22 @@ def main() -> None:
     )
     parser.add_argument("--start", type=int, default=0, help="First frame to render (default 0).")
     parser.add_argument("--end", type=int, default=None, help="Last frame to render (exclusive). Default: end of motion.")
+    parser.add_argument(
+        "--constraints",
+        type=Path,
+        default=None,
+        help="Path to a constraints.json to overlay as world-fixed markers (root path / "
+        "end-effector / full-body keyframes). Defaults to 'constraints.json' next to the NPZ "
+        "if present. Implies --camera fixed unless overridden.",
+    )
+    parser.add_argument(
+        "--camera",
+        choices=("follow", "fixed"),
+        default=None,
+        help="'follow' (default w/o constraints): camera tracks the root, character stays "
+        "centered. 'fixed' (default w/ constraints): static camera frames the whole clip so the "
+        "floor stays put and the character moves across it.",
+    )
     args = parser.parse_args()
 
     views = [v.strip() for v in args.view.split(",") if v.strip()]
@@ -334,6 +511,30 @@ def main() -> None:
     faces = skin.faces.cpu().numpy()
     print(f"  vertices: {verts_all.shape}, faces: {faces.shape}")
 
+    # ---- optional constraint overlay + fixed (non-tracking) camera ----
+    constraints_path = args.constraints
+    if constraints_path is None:
+        cand = args.npz.parent / "constraints.json"
+        if cand.is_file():
+            constraints_path = cand
+    constraint_mesh = None
+    marker_points = np.zeros((0, 3), dtype=np.float64)
+    if constraints_path is not None and Path(constraints_path).is_file():
+        from kimodo.constraints import load_constraints_lst
+
+        cons_skel = SOMASkeleton77()  # CPU skeleton; from_dict runs FK -> world targets
+        cons = load_constraints_lst(str(constraints_path), cons_skel, device="cpu")
+        constraint_mesh, marker_points = build_constraint_meshes(cons, cons_skel, start, end)
+        types = ", ".join(getattr(c, "name", "?") for c in cons)
+        print(f"  constraints: {len(cons)} set(s) [{types}] from {Path(constraints_path).name}; "
+              f"{marker_points.shape[0]} marker(s)")
+    elif args.constraints is not None:
+        print(f"  WARNING: --constraints file not found: {args.constraints}")
+
+    # Camera mode: explicit flag wins; otherwise 'fixed' when constraints are present.
+    camera_mode = args.camera or ("fixed" if constraint_mesh is not None else "follow")
+    frame_points = posed_joints_np[start:end].reshape(-1, 3).astype(np.float64)
+
     width = _round_up(args.width, 16)
     height = _round_up(args.height, 16)
 
@@ -363,10 +564,20 @@ def main() -> None:
         out_dir = base_path.parent
         base_stem = base_path.name
 
+    aspect = width / float(height)
     for view in views:
         preset = VIEW_PRESETS[view]
-        print(f"[{view}] camera offset={preset['offset']}, look_h={preset['look_at_height']}")
-        frames = render_motion(verts_all, faces, root_xz, preset, width=width, height=height)
+        fixed_cam_pose = None
+        if camera_mode == "fixed":
+            fixed_cam_pose = compute_fixed_camera_pose(
+                preset, frame_points, marker_points, yfov=_YFOV, aspect=aspect,
+            )
+        print(f"[{view}] camera={camera_mode}, offset_dir={preset['offset']}")
+        frames = render_motion(
+            verts_all, faces, root_xz, preset, width=width, height=height,
+            camera_mode=camera_mode, fixed_cam_pose=fixed_cam_pose,
+            constraint_mesh=constraint_mesh,
+        )
         if (
             not is_dir_output
             and len(views) == 1

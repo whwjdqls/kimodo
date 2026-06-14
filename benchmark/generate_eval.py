@@ -84,6 +84,17 @@ def parse_args():
         action="store_true",
         help="Uses fp32 for instantiating the text encoder (if API is not already running) rather than default bfloat16.",
     )
+    parser.add_argument(
+        "--text-cache",
+        dest="text_cache",
+        type=str,
+        default=None,
+        help="Path to a precomputed text-embedding cache (.pt) built by "
+        "benchmark/precompute_benchmark_text.py. When set, prompts are served by "
+        "a CachedTextEncoder (dict lookup) and the live LLM2Vec-8B encoder is "
+        "never loaded. The cache MUST cover every prompt in --benchmark "
+        "(misses raise KeyError).",
+    )
     return parser.parse_args()
 
 
@@ -227,10 +238,21 @@ def main():
         raise SystemExit(f"No folders with meta.json found under {testsuite_root}")
     print(f"Discovered {len(examples)} example folders.")
 
+    # Optional precomputed text-embedding cache: serve prompts via a dict lookup
+    # so the live LLM2Vec-8B encoder is never built. Injected through the
+    # existing text_encoder= param, which bypasses encoder construction.
+    cached_text_encoder = None
+    if args.text_cache is not None:
+        from kimodo.model.cached_text import CachedTextEncoder
+
+        print(f"Using precomputed text-embedding cache: {args.text_cache}")
+        cached_text_encoder = CachedTextEncoder(cache_path=args.text_cache, device=device)
+
     if args.model_dir is not None:
         model = load_model_from_dir(
             args.model_dir,
             device=device,
+            text_encoder=cached_text_encoder,
             text_encoder_fp32=args.text_encoder_fp32,
         )
         resolved_name = f"local:{Path(args.model_dir).name}"
@@ -240,6 +262,7 @@ def main():
             device=device,
             default_family="Kimodo",
             return_resolved_name=True,
+            text_encoder=cached_text_encoder,
             text_encoder_fp32=args.text_encoder_fp32,
         )
         # v1.1 models are meant to be used for benchmark evaluation

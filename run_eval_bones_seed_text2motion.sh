@@ -7,11 +7,11 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G
 #SBATCH --time=1-00:00:00
-#SBATCH --output=/home/jungbin_cho/kimodo_open/eval_logs/eval_bseed_t2m_%j.log
-#SBATCH --error=/home/jungbin_cho/kimodo_open/eval_logs/eval_bseed_t2m_%j.err
+#SBATCH --output=/home/jungbin_cho/kimodo_open/runs/bones_seed/eval/logs/eval_bseed_t2m_%j.log
+#SBATCH --error=/home/jungbin_cho/kimodo_open/runs/bones_seed/eval/logs/eval_bseed_t2m_%j.err
 
 set -euo pipefail
-mkdir -p /home/jungbin_cho/kimodo_open/eval_logs
+mkdir -p /home/jungbin_cho/kimodo_open/runs/bones_seed/eval/logs
 echo "Job started on $(hostname) at $(date)"
 source /home/jungbin_cho/miniconda3/etc/profile.d/conda.sh
 conda activate kimodo
@@ -21,8 +21,11 @@ cd /home/jungbin_cho/kimodo_open
 # is stale, so we force --fps 20 when building). Symmetric: gen 20fps, GT 20fps.
 RUN_DIR=/home/jungbin_cho/kimodo_open/runs/bones_seed
 CKPT=latest.pt
-MODEL_DIR=/home/jungbin_cho/kimodo_eval_models/BS-Full
-GEN_ROOT=/home/jungbin_cho/kimodo_eval_gen/BS-Full
+# Eval artifacts live under the model's run dir: runs/<model>/eval/{models,gen,logs}/<label>
+EVAL_DIR=${RUN_DIR}/eval
+LABEL=${CKPT%.pt}
+MODEL_DIR=${EVAL_DIR}/models/${LABEL}
+GEN_ROOT=${EVAL_DIR}/gen/${LABEL}
 TS=/home/jungbin_cho/Kimodo-Motion-Gen-Benchmark-20fps/testsuite
 
 echo; echo "=== [1/5] build model folder (force fps=20) ==="
