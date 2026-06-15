@@ -98,6 +98,7 @@ class OnestageDenoiser(nn.Module):
         first_heading_angle: Optional[torch.Tensor] = None,
         motion_mask: Optional[torch.Tensor] = None,
         observed_motion: Optional[torch.Tensor] = None,
+        shape_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return ``(B, T, motion_rep_dim)`` — predicted clean motion (x0).
 
@@ -121,4 +122,5 @@ class OnestageDenoiser(nn.Module):
             text_feat_pad_mask,
             timesteps,
             first_heading_angle,
+            shape_feat=shape_feat,
         )

@@ -1,0 +1,89 @@
+# Shape-aware BONES-SEED training config.
+# Inherits its structure from bones_seed_small.yaml; the differences are:
+#   - data.kind: bones_seed_shape_aware       (loads SOMABonesSeedDatasetShapeAware)
+#   - data.data_root points at the proportional (per-actor body) NPZ tree
+#   - data.packed_proportional_motions_path: the actor-dedup motion pack
+#   - data.nan_audit_path: drops the 679 NaN-tainted files
+#   - stats_path: recomputed against the proportional pack (per-actor FK)
+#   - model_config_path: shape-aware model variant with shape_dim=512 on the
+#                         backbone block (allocates embed_shape Linear).
+#   - shape_encoder: ShapeEncoder hyperparams (J=30, output_dim=512).
+#   - trainer.shape_drop_prob: 0.10 (drops the shape token per-sample so the
+#                         model handles unconditioned inference; the FK loss
+#                         still uses the actor's true neutrals).
+
+# ----- data -----
+data:
+  kind: bones_seed_shape_aware
+  data_root: /weka/jungbin/seed/soma_proportional_motions_20fps
+  natural_csv_path: /weka/jungbin/seed/metadata/seed_metadata_v004.csv
+  temporal_labels_path: /weka/jungbin/seed/metadata/seed_metadata_v002_temporal_labels.jsonl
+  multi_timeline_path: /weka/jungbin/seed/multi_timeline.jsonl
+  train_split_path: /weka/jungbin/Kimodo-Motion-Gen-Benchmark/splits/train_split_paths.txt
+  packed_proportional_motions_path: /weka/jungbin/kimodo_caches/bones_seed_proportional_raw.pt
+  nan_audit_path: /home/jungbin_cho/_nan_audit_proportional.json
+  fps: 20
+  min_frames: 10
+  max_frames: 200
+  max_clip_sec: 10.0
+  max_segment_sec: 15.0
+  rand_offset_max_sec: 2.0
+  include_mirrored: true
+  random_heading_aug: true
+  cache_index: ${output_dir}/bones_seed_proportional_index.json
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+
+# ----- model -----
+model_config_path: /home/jungbin_cho/kimodo_open/configs/model/kimodo_bones_seed_skel_aware.yaml
+stats_path: /weka/jungbin/kimodo_caches/stats/proportional/
+denoiser_fps_override: 20
+init_from_safetensors: null
+
+# ----- text encoder -----
+text_encoder:
+  type: llm2vec
+  device: auto
+  fp32: false
+
+# ----- shape encoder -----
+shape_encoder:
+  n_joints: 30
+  hidden_dim: 256
+  output_dim: 512                # must match model_config_path: denoiser.shape_dim
+  num_layers: 3
+  normalize_output: true
+
+# ----- training loop -----
+trainer:
+  output_dir: ${output_dir}
+  batch_size: 64
+  grad_accum: 1
+  num_steps: 500_000
+  lr: 2.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  warmup_steps: 1000
+  log_every: 50
+  ckpt_every: 5000
+  text_drop_prob: 0.1
+  shape_drop_prob: 0.1
+  ema_decay: 0.995
+  ema_every: 10
+  mixed_precision: bf16
+  grad_clip: 1.0
+  resume_from: null
+  seed: 0
+  loss_weights:
+    smooth_root_pos: 10.0
+    global_root_heading: 2.0
+    local_joints_positions: 10.0
+    velocities: 3.0
+    global_rot_data: 10.0
+    foot_contacts: 4.0
+    fk: 5.0
+  smooth_l1_beta: 1.0
+  phase: text
+
+output_dir: /home/jungbin_cho/kimodo_open/runs/bones_seed_skel_aware

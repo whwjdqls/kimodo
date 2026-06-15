@@ -330,6 +330,7 @@ def render_single(
     skip_joints: Optional[Sequence[int]] = None,
     camera: str = "follow",
     constraints: Optional[dict] = None,
+    floor_alpha: float = 0.55,
 ) -> np.ndarray:
     """One skeleton + its trail with a tracking (or static) camera and world-grid floor."""
     joints = _to_display(joints)
@@ -353,11 +354,15 @@ def render_single(
             fig.clf()
             root = trail[t]
             ax = fig.add_subplot(1, 1, 1, projection="3d")
+            # Honor artist zorder (floor=0 < grid=1 < trail=2 < bones=4 < joints=5
+            # < marker=6) instead of mplot3d's depth sort, so an opaque floor never
+            # overdraws the skeleton or the on-floor pelvis trail.
+            ax.computed_zorder = False
             vp = fixed_vp if fixed_vp is not None else _viewport_for_center(
                 (root[0], root[2]), view_half, extent["y_top"],
             )
             _setup_axes(ax, vp, f"t={t}")
-            _draw_floor_and_grid(ax, extent, spacing=grid_spacing)
+            _draw_floor_and_grid(ax, extent, spacing=grid_spacing, floor_alpha=floor_alpha)
             if cons is not None:
                 _draw_constraint_markers(ax, cons)
             _draw_trajectory(ax, trail, t, color)

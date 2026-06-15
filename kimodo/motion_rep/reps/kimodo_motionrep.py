@@ -47,7 +47,7 @@ class KimodoMotionRep(MotionRepBase):
         }
         super().__init__(skeleton, fps, stats_path)
 
-    @ensure_batched(local_joint_rots=5, root_positions=3, lengths=1)
+    @ensure_batched(local_joint_rots=5, root_positions=3, lengths=1, neutral_joints=3)
     def __call__(
         self,
         local_joint_rots: torch.Tensor,
@@ -55,6 +55,7 @@ class KimodoMotionRep(MotionRepBase):
         to_normalize: bool,
         to_canonicalize: bool = False,
         lengths: Optional[torch.Tensor] = None,
+        neutral_joints: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Convert local rotations and root trajectory into smooth-root features.
 
@@ -64,6 +65,9 @@ class KimodoMotionRep(MotionRepBase):
             to_normalize: Whether to normalize output features.
             to_canonicalize: Whether to canonicalize output features (False by default).
             lengths: Optional valid lengths for variable-length batches.
+            neutral_joints: Optional per-sample rest-pose joints ``[B, J, 3]``.
+                ``None`` (default) → use ``skeleton.neutral_joints`` — the legacy
+                shape-unaware path.
 
         Returns:
             Motion features with shape ``[B, T, motion_rep_dim]``.
@@ -73,11 +77,20 @@ class KimodoMotionRep(MotionRepBase):
             assert local_joint_rots.shape[0] == 1, "If lenghts is not provided, the input should not be batched."
             lengths = torch.tensor([local_joint_rots.shape[1]], device=device)
 
+        # Per-actor neutrals are (B, J, 3) and are constant over time, but the
+        # FK call sees a (B, T)-flattened batch via ensure_batched. Expand once
+        # along T so the inner decorator's batch-shape check passes without a
+        # T-dim broadcast inside fk().
+        nj = neutral_joints
+        if nj is not None and nj.ndim == 3:
+            T = local_joint_rots.shape[1]
+            nj = nj.unsqueeze(1).expand(-1, T, -1, -1).contiguous()
+
         (
             global_joints_rots,
             global_joints_positions,
             local_joints_positions_origin_is_pelvis,
-        ) = fk(local_joint_rots, root_positions, self.skeleton)
+        ) = fk(local_joint_rots, root_positions, self.skeleton, neutral_joints=nj)
 
         root_heading_angle = compute_heading_angle(global_joints_positions, self.skeleton)
         global_root_heading = torch.stack([torch.cos(root_heading_angle), torch.sin(root_heading_angle)], dim=-1)
@@ -163,15 +176,21 @@ class KimodoMotionRep(MotionRepBase):
         new_smooth_root_pos[:, :, 2] += translation_2d[:, [1]]
         return new_features
 
-    @ensure_batched(features=3)
+    @ensure_batched(features=3, neutral_joints=3)
     def inverse(
         self,
         features: torch.Tensor,
         is_normalized: bool,
         posed_joints_from="rotations",
         return_numpy: bool = False,
+        neutral_joints: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Decode smooth-root features into motion tensors."""
+        """Decode smooth-root features into motion tensors.
+
+        ``neutral_joints``: optional per-sample rest-pose joints ``[B, J, 3]``.
+        ``None`` (default) → canonical ``skeleton.neutral_joints`` — the legacy
+        shape-unaware path.
+        """
         assert posed_joints_from in [
             "rotations",
             "positions",
@@ -202,6 +221,7 @@ class KimodoMotionRep(MotionRepBase):
             _, posed_joints, _ = self.skeleton.fk(
                 local_rot_mats,
                 root_positions,
+                neutral_joints=neutral_joints,
             )
         else:
             posed_joints = posed_joints_from_pos

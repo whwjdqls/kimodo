@@ -97,6 +97,11 @@ class TransformerEncoderBlockConfig:
     # Input first heading angle
     input_first_heading_angle: bool = False
 
+    # Shape conditioning: dim of the shape-encoder output prefix token.
+    # ``None`` (default) → no shape projection allocated, ``shape_feat`` kwarg on
+    # forward is silently ignored. Existing checkpoints load and run unchanged.
+    shape_dim: Optional[int] = None
+
 
 class TransformerEncoderBlock(nn.Module):
     @validate(TransformerEncoderBlockConfig, save_args=True, super_init=True)
@@ -117,6 +122,13 @@ class TransformerEncoderBlock(nn.Module):
         self.input_linear = nn.Linear(self.input_dim, self.latent_dim)
         self.output_linear = nn.Linear(self.latent_dim, self.output_dim)
         self.linear_first_heading_angle = nn.Linear(2, self.latent_dim)
+
+        # Optional shape-prefix projection. Allocated only when shape_dim is set
+        # so existing checkpoints (no embed_shape.* keys) load cleanly.
+        if self.shape_dim is not None:
+            self.embed_shape = nn.Linear(int(self.shape_dim), self.latent_dim)
+        else:
+            self.embed_shape = None
 
         trans_enc_layer = TransformerEncoderLayer(
             d_model=self.latent_dim,
@@ -141,6 +153,7 @@ class TransformerEncoderBlock(nn.Module):
         text_feat_pad_mask: torch.Tensor,
         timesteps: Tensor,
         first_heading_angle: Optional[Tensor] = None,
+        shape_feat: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
@@ -206,6 +219,18 @@ class TransformerEncoderBlock(nn.Module):
             )
             prefix_feats = torch.cat((prefix_feats, first_heading_angle_feats), axis=1)
             prefix_mask = torch.cat((prefix_mask, first_heading_angle_mask), axis=1)
+
+        # Shape prefix token. Only fires when this block was built with
+        # ``shape_dim`` set; existing checkpoints have ``embed_shape=None`` so
+        # any caller-passed ``shape_feat`` is silently ignored to preserve the
+        # legacy forward signature.
+        if self.embed_shape is not None and shape_feat is not None:
+            shape_emb = self.embed_shape(shape_feat)                   # (B, 1, D)
+            shape_mask = torch.ones(
+                (batch_size, shape_emb.shape[1]), dtype=bool, device=x.device,
+            )
+            prefix_feats = torch.cat((prefix_feats, shape_emb), axis=1)
+            prefix_mask = torch.cat((prefix_mask, shape_mask), axis=1)
 
         # compute the number of prefix features
         pose_start_ind = prefix_feats.shape[1]

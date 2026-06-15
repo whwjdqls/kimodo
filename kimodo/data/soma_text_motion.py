@@ -301,7 +301,7 @@ def build_collate_fn(pad_value: float = 0.0, pad_to: Optional[int] = None) -> Ca
             motions[i, :T] = item["motion"]
             pad_mask[i, :T] = True
 
-        return {
+        out = {
             "motion": motions,
             "lengths": lengths,
             "pad_mask": pad_mask,
@@ -312,6 +312,14 @@ def build_collate_fn(pad_value: float = 0.0, pad_to: Optional[int] = None) -> Ca
             "filename": [item["filename"] for item in batch],
             "start_frame": [item["start_frame"] for item in batch],
         }
+        # Shape-aware path: SOMABonesSeedDatasetShapeAware emits per-sample
+        # rest-pose joints. Stack them when present; shape-unaware datasets
+        # never include this key so the legacy collate output is unchanged.
+        if "neutral_joints" in batch[0]:
+            out["neutral_joints"] = torch.stack(
+                [item["neutral_joints"] for item in batch], dim=0,
+            )
+        return out
 
     return collate
 
@@ -927,4 +935,172 @@ class SOMABonesSeedDataset(Dataset):
             "filename": entry.filename,
             "source": entry.source,
             "start_frame": int(round(entry.seg_start_sec * self.fps)),
+        }
+
+
+# =====================================================================
+# Shape-aware (per-actor neutrals) variant of the BONES-SEED mixture
+# =====================================================================
+class SOMABonesSeedDatasetShapeAware(SOMABonesSeedDataset):
+    """BONES-SEED dataset that emits per-sample rest-pose joints (30-joint subset).
+
+    Differences from :class:`SOMABonesSeedDataset`:
+      * ``data_root`` should point at the proportional NPZ tree (each motion's
+        FK has actor-specific bone lengths).
+      * ``packed_motions_path`` should point at the proportional motion pack
+        (``pack_bones_seed_motions_proportional.py`` output), which carries
+        per-actor ``actor_neutrals (N_actors, 77, 3)`` + ``motion_actor_idx``.
+      * ``nan_audit_path`` filters NaN-tainted source files at index build time.
+      * Each ``__getitem__`` adds ``"neutral_joints"`` ``(30, 3)`` for the
+        sample's actor — already sliced to the 30-joint SOMA subset.
+      * Features are computed with ``motion_rep(..., neutral_joints=...)`` so
+        FK uses the actor's true rest pose, NOT the canonical T-pose.
+
+    Everything else (mixture interleave, canonicalize, random heading,
+    normalization, packed-features fallback) is inherited verbatim.
+    """
+
+    def __init__(
+        self,
+        *args,
+        nan_audit_path: Optional[str | Path] = None,
+        **kwargs,
+    ):
+        self._nan_audit_path = Path(nan_audit_path) if nan_audit_path else None
+        self._nan_filenames: set[str] = self._load_nan_audit_filenames()
+        super().__init__(*args, **kwargs)
+
+        if not getattr(self, "_packed", False):
+            raise RuntimeError(
+                "SOMABonesSeedDatasetShapeAware requires a proportional motion pack "
+                "with actor_neutrals / motion_actor_idx; pass packed_motions_path.",
+            )
+        if not hasattr(self, "_actor_neutrals_30"):
+            raise RuntimeError(
+                "Loaded pack at %s lacks actor_neutrals / motion_actor_idx; rebuild "
+                "with pack_bones_seed_motions_proportional.py." % self.packed_motions_path,
+            )
+
+    def _load_nan_audit_filenames(self) -> set[str]:
+        if self._nan_audit_path is None or not self._nan_audit_path.is_file():
+            return set()
+        report = json.load(open(self._nan_audit_path))
+        out: set[str] = set()
+        for r in report.get("nan_files", []) + report.get("load_error_files", []):
+            p = Path(r["path"])
+            out.add(p.stem)
+        log.info(
+            "SOMABonesSeedDatasetShapeAware: %d NaN-tainted filenames will be skipped "
+            "at index build time (audit=%s).", len(out), self._nan_audit_path,
+        )
+        return out
+
+    def _build_natural_pool(self, out, path_by_name):
+        # Drop NaN-flagged entries from the path index before building the pool.
+        if self._nan_filenames:
+            filtered = {k: v for k, v in path_by_name.items() if k not in self._nan_filenames}
+            dropped = len(path_by_name) - len(filtered)
+            path_by_name = filtered
+            log.info("Natural pool: dropped %d NaN-tainted filenames", dropped)
+        super()._build_natural_pool(out, path_by_name)
+
+    def _build_single_timeline_pool(self, out, path_by_name):
+        if self._nan_filenames:
+            path_by_name = {k: v for k, v in path_by_name.items() if k not in self._nan_filenames}
+        super()._build_single_timeline_pool(out, path_by_name)
+
+    def _build_multi_timeline_pool(self, out, path_by_name):
+        if self._nan_filenames:
+            path_by_name = {k: v for k, v in path_by_name.items() if k not in self._nan_filenames}
+        super()._build_multi_timeline_pool(out, path_by_name)
+
+    def _load_packed_motions(self) -> None:
+        # Same mmap load as the parent, but additionally read the actor-dedup
+        # fields and pre-slice neutrals to the 30-joint SOMA subset.
+        super()._load_packed_motions()
+        if not self._packed:
+            return
+        path = self.packed_motions_path
+        try:
+            blob = torch.load(
+                str(path), map_location="cpu", weights_only=False, mmap=True,
+            )
+        except (RuntimeError, TypeError):
+            blob = torch.load(str(path), map_location="cpu", weights_only=False)
+        if "actor_neutrals" not in blob or "motion_actor_idx" not in blob:
+            return  # legacy pack without actor dedup; caller will raise
+        actor_neutrals_77 = blob["actor_neutrals"]                         # (N_actors, 77, 3)
+        motion_actor_idx = blob["motion_actor_idx"]                        # (N_motions,) int32
+        idx_30_in_77 = self.skeleton.get_skel_slice(self.skeleton.somaskel77)
+        self._idx_30_in_77 = torch.tensor(idx_30_in_77, dtype=torch.long)
+        self._actor_neutrals_30 = actor_neutrals_77[:, self._idx_30_in_77].contiguous()
+        # Map filename -> actor index for O(1) per-item lookup.
+        self._name_to_actor_idx = {
+            n: int(motion_actor_idx[i]) for i, n in enumerate(blob["names"])
+        }
+        log.info(
+            "SOMABonesSeedDatasetShapeAware: indexed %d actors, %d motions "
+            "(neutral_joints sliced to %d joints).",
+            self._actor_neutrals_30.shape[0], len(self._name_to_actor_idx),
+            self._actor_neutrals_30.shape[1],
+        )
+
+    def _neutrals_for(self, filename: str) -> Optional[torch.Tensor]:
+        a_idx = self._name_to_actor_idx.get(filename)
+        if a_idx is None:
+            return None
+        return self._actor_neutrals_30[a_idx]                              # (30, 3)
+
+    def _features_with_canonicalize(
+        self, local_rot_30: torch.Tensor, root_positions: torch.Tensor, T: int,
+        neutral_joints: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        lengths = torch.tensor([T])
+        nj = neutral_joints.unsqueeze(0) if neutral_joints is not None else None
+        feats = self.motion_rep(
+            local_rot_30.unsqueeze(0),
+            root_positions.unsqueeze(0),
+            to_normalize=False,
+            to_canonicalize=True,
+            lengths=lengths,
+            neutral_joints=nj,
+        )[0]
+        return feats
+
+    def __getitem__(self, index: int) -> dict:
+        # Mirrors the parent but feeds neutrals into the FK pass. The packed-
+        # features Tier-2 shortcut is intentionally NOT supported here — the
+        # 369-D features depend on the actor's neutrals, so a one-shot feature
+        # pack would freeze that choice and break shape conditioning.
+        source = self.SOURCES[index % 3]
+        pool = self._pools[source]
+        entry = pool[(index // 3) % len(pool)]
+
+        neutrals = self._neutrals_for(entry.filename)
+        if neutrals is None:
+            # Unknown actor (e.g. file not in the proportional pack) — drop.
+            return self[(index + 1) % len(self)]
+
+        local_rot, root_pos, T = self._load_segment(entry)
+        if T < self.min_frames:
+            return self[(index + 1) % len(self)]
+
+        features = self._features_with_canonicalize(local_rot, root_pos, T, neutral_joints=neutrals)
+        features, _angle = self._apply_random_heading(features)
+
+        heading_cs = features[0, self.motion_rep.slice_dict["global_root_heading"]]
+        first_heading = float(torch.atan2(heading_cs[1], heading_cs[0]).item())
+
+        if self.normalize:
+            features = self.motion_rep.normalize(features)
+
+        return {
+            "motion": features,
+            "length": int(features.shape[0]),
+            "text": entry.text,
+            "first_heading_angle": first_heading,
+            "filename": entry.filename,
+            "source": entry.source,
+            "start_frame": int(round(entry.seg_start_sec * self.fps)),
+            "neutral_joints": neutrals,                                    # (30, 3) for this actor
         }

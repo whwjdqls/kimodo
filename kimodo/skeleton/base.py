@@ -233,18 +233,46 @@ class SkeletonBase(torch.nn.Module):
             return "cpu"
         return self.neutral_joints.device
 
-    def fk(self, local_joint_rots: torch.Tensor, root_positions: torch.Tensor):
+    def fk(
+        self,
+        local_joint_rots: torch.Tensor,
+        root_positions: torch.Tensor,
+        neutral_joints: torch.Tensor | None = None,
+    ):
         """Run forward kinematics for this skeleton layout.
 
         Args:
             local_joint_rots: Local joint rotation matrices with shape
                 `(..., J, 3, 3)`.
             root_positions: Root translations with shape `(..., 3)`.
+            neutral_joints: Optional per-sample rest-pose joint positions.
+                Accepts ``(B, J, 3)`` (per-sample, constant over time) or
+                ``(B, T, J, 3)`` (per-frame). When ``(B, J, 3)`` is paired with
+                ``(B, T)``-batched rotations, this method broadcasts the
+                neutrals across T to satisfy ``ensure_batched``'s batch-shape
+                check inside :func:`fk`. ``None`` (default) → use the canonical
+                ``self.neutral_joints`` buffer — the legacy shape-unaware path.
 
         Returns:
             Tuple of `(global_joint_rots, posed_joints, posed_joints_norootpos)`.
         """
-        global_joint_rots, posed_joints, posed_joints_norootpos = fk(local_joint_rots, root_positions, self)
+        # Broadcast (B, J, 3) -> (B, T, J, 3) when the local rotations carry a
+        # time dim. Otherwise pass through unchanged (calls that already match
+        # the canonical's batch shape stay zero-overhead).
+        if (
+            neutral_joints is not None
+            and neutral_joints.ndim + 2 == local_joint_rots.ndim
+        ):
+            t_dims = local_joint_rots.shape[1 : local_joint_rots.ndim - 3]
+            for _ in t_dims:
+                neutral_joints = neutral_joints.unsqueeze(1)
+            neutral_joints = neutral_joints.expand(
+                *local_joint_rots.shape[: local_joint_rots.ndim - 3],
+                *neutral_joints.shape[-2:],
+            ).contiguous()
+        global_joint_rots, posed_joints, posed_joints_norootpos = fk(
+            local_joint_rots, root_positions, self, neutral_joints=neutral_joints,
+        )
         return global_joint_rots, posed_joints, posed_joints_norootpos
 
     def to_standard_tpose(self, local_rot_mats: torch.Tensor):

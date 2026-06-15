@@ -11,12 +11,13 @@ import torch.nn.functional as F
 from ..tools import ensure_batched
 
 
-@ensure_batched(local_joint_rots=4, root_positions=2)
+@ensure_batched(local_joint_rots=4, root_positions=2, neutral_joints=3)
 def fk(
     local_joint_rots: torch.Tensor,
     root_positions: torch.Tensor,
     skeleton,
     root_positions_is_global: bool = True,
+    neutral_joints: torch.Tensor | None = None,
 ):
     """Compute global joint rotations and positions from local rotations.
 
@@ -27,6 +28,11 @@ def fk(
             `root_idx`.
         root_positions_is_global: If `True`, neutral joints are recentered so root
             translations are interpreted in world space.
+        neutral_joints: Optional per-sample rest-pose joint positions ``(B, J, 3)``.
+            When ``None`` (default), the canonical ``skeleton.neutral_joints``
+            ``(J, 3)`` is broadcast over the batch — the legacy shape-unaware path.
+            Pass a batched tensor to FK each sample against its own body shape
+            (used by the shape-aware training path).
 
     Returns:
         Tuple `(global_joint_rots, posed_joints, posed_joints_norootpos)`.
@@ -41,24 +47,33 @@ def fk(
         rest_local = rest_local.to(device=device, dtype=dtype)
         local_joint_rots = torch.einsum("jmn,...jno->...jmo", rest_local, local_joint_rots)
 
-    # Rest positions for FK. Must be consistent with rest_local: when local = identity,
-    # FK(rest_local, neutral_joints) should equal the XML rest pose positions. So
-    # neutral_joints are not necessarily the raw XML joint positions; they are the
-    # rest layout that, when rotated by rest_local, yields the XML rest positions.
-    neutral_joints = skeleton.neutral_joints.to(device=device, dtype=dtype)
+    if neutral_joints is None:
+        # Rest positions for FK. Must be consistent with rest_local: when local = identity,
+        # FK(rest_local, neutral_joints) should equal the XML rest pose positions. So
+        # neutral_joints are not necessarily the raw XML joint positions; they are the
+        # rest layout that, when rotated by rest_local, yields the XML rest positions.
+        nj = skeleton.neutral_joints.to(device=device, dtype=dtype)
 
-    if root_positions_is_global is True:
-        # Removing the pelvis offset from the neutral joints
-        # as the root positions does not depends on the pelvis offset of the skeleton
-        pelvis_offset = neutral_joints[skeleton.root_idx]
-        neutral_joints = neutral_joints - pelvis_offset
+        if root_positions_is_global is True:
+            # Removing the pelvis offset from the neutral joints
+            # as the root positions does not depends on the pelvis offset of the skeleton
+            pelvis_offset = nj[skeleton.root_idx]
+            nj = nj - pelvis_offset
+
+        joints = einops.repeat(
+            nj,
+            "j k -> b j k",
+            b=len(local_joint_rots),
+        )
+    else:
+        # Per-sample neutrals: the ensure_batched decorator has flattened the
+        # batch dims, so we receive shape (B, J, 3) matching local_joint_rots.
+        joints = neutral_joints.to(device=device, dtype=dtype)
+        if root_positions_is_global is True:
+            pelvis_offset = joints[:, skeleton.root_idx]  # (B, 3)
+            joints = joints - pelvis_offset[:, None]
 
     # compute joint position and global rotations
-    joints = einops.repeat(
-        neutral_joints,
-        "j k -> b j k",
-        b=len(local_joint_rots),
-    )
     posed_joints_norootpos, global_joint_rots = batch_rigid_transform(
         local_joint_rots,
         joints,

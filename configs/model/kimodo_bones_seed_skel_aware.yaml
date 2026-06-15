@@ -1,0 +1,30 @@
+_target_: kimodo.model.Kimodo
+num_base_steps: 1000
+cfg_type: separated
+denoiser:
+  _target_: kimodo.model.twostage_denoiser.TwostageDenoiser
+  ckpt_path: ${oc.select:checkpoint_dir}/model.safetensors
+  motion_mask_mode: concat
+  motion_rep:
+    _target_: kimodo.motion_rep.KimodoMotionRep
+    fps: 20
+    stats_path: ${oc.select:checkpoint_dir}/stats/motion/
+    skeleton:
+      _target_: kimodo.skeleton.SOMASkeleton30
+  llm_shape:
+  - 1
+  - 4096
+  use_text_mask: false
+  latent_dim: 1024
+  ff_size: 2048
+  num_layers: 16
+  num_heads: 8
+  activation: gelu
+  dropout: 0.0
+  pe_dropout: 0.0
+  norm_first: false
+  num_text_tokens_override: 50
+  input_first_heading_angle: true
+  # Shape conditioning: matches the ShapeEncoder's output_dim in the trainer
+  # config so its (B, 1, 512) prefix projects cleanly into latent_dim=1024.
+  shape_dim: 512

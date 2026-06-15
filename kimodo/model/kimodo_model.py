@@ -86,6 +86,7 @@ class Kimodo(nn.Module):
         cfg_weight: Union[float, Tuple[float, float]],
         guide_masks: Optional[Dict] = None,
         cfg_type: Optional[str] = None,
+        shape_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Single denoising step.
 
@@ -114,6 +115,7 @@ class Kimodo(nn.Module):
                 motion_mask,
                 observed_motion,
                 cfg_type=cfg_type,
+                shape_feat=shape_feat,
             )
 
         # sampler computes next step noisy motion

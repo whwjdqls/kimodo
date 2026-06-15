@@ -33,6 +33,7 @@ class ClassifierFreeGuidedModel(nn.Module):
         motion_mask: Optional[torch.Tensor] = None,
         observed_motion: Optional[torch.Tensor] = None,
         cfg_type: Optional[str] = None,
+        shape_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -66,6 +67,7 @@ class ClassifierFreeGuidedModel(nn.Module):
                 first_heading_angle=first_heading_angle,
                 motion_mask=motion_mask,
                 observed_motion=observed_motion,
+                shape_feat=shape_feat,
             )
         elif cfg_type == "regular":
             assert isinstance(cfg_weight, (float, int)), "cfg_weight must be a single float for regular CFG"
@@ -77,6 +79,11 @@ class ClassifierFreeGuidedModel(nn.Module):
                 observed_motion = torch.concatenate([observed_motion, observed_motion], dim=0)
             if first_heading_angle is not None:
                 first_heading_angle = torch.concatenate([first_heading_angle, first_heading_angle], dim=0)
+            if shape_feat is not None:
+                # Shape conditioning is preserved across BOTH passes — the
+                # uncond pass drops only text/constraint, the body still
+                # belongs to the same actor.
+                shape_feat = torch.concatenate([shape_feat, shape_feat], dim=0)
 
             out_cond_uncond = self.model(
                 torch.concatenate([x, x], dim=0),
@@ -87,6 +94,7 @@ class ClassifierFreeGuidedModel(nn.Module):
                 first_heading_angle=first_heading_angle,
                 motion_mask=motion_mask,
                 observed_motion=observed_motion,
+                shape_feat=shape_feat,
             )
 
             out, out_uncond = torch.chunk(out_cond_uncond, 2)
@@ -103,6 +111,11 @@ class ClassifierFreeGuidedModel(nn.Module):
                 first_heading_angle = torch.concatenate(
                     [first_heading_angle, first_heading_angle, first_heading_angle],
                     dim=0,
+                )
+            if shape_feat is not None:
+                # Same body across all three passes (see ``regular`` branch above).
+                shape_feat = torch.concatenate(
+                    [shape_feat, shape_feat, shape_feat], dim=0,
                 )
 
             out_cond_uncond = self.model(
@@ -121,6 +134,7 @@ class ClassifierFreeGuidedModel(nn.Module):
                 first_heading_angle=first_heading_angle,
                 motion_mask=motion_mask,
                 observed_motion=observed_motion,
+                shape_feat=shape_feat,
             )
 
             out_text, out_constraint, out_uncond = torch.chunk(out_cond_uncond, 3)
