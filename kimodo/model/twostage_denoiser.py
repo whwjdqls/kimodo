@@ -90,6 +90,7 @@ class TwostageDenoiser(nn.Module):
         first_heading_angle: Optional[torch.Tensor] = None,
         motion_mask: Optional[torch.Tensor] = None,
         observed_motion: Optional[torch.Tensor] = None,
+        shape_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -122,6 +123,7 @@ class TwostageDenoiser(nn.Module):
             text_feat_pad_mask,
             timesteps,
             first_heading_angle,
+            shape_feat=shape_feat,
         )  # [B, T, 5]
 
         # Maybe pass this as argument instead of recomputing it
@@ -156,6 +158,7 @@ class TwostageDenoiser(nn.Module):
             text_feat_pad_mask,
             timesteps,
             first_heading_angle,
+            shape_feat=shape_feat,
         )
 
         # concatenate the predicted local body with the predicted root

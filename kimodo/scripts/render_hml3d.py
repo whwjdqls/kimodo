@@ -102,7 +102,8 @@ def _viewport_for_center(
 # -----------------------------------------------------------------------------
 # Scene element drawers
 # -----------------------------------------------------------------------------
-def _draw_floor_and_grid(ax, extent: dict, spacing: float = DEFAULT_GRID_SPACING):
+def _draw_floor_and_grid(ax, extent: dict, spacing: float = DEFAULT_GRID_SPACING,
+                         floor_alpha: float = 0.55):
     """Gray floor quad + world-coordinate grid lines spanning the full motion extent.
 
     Grid lines live in world coords; as the per-frame viewport scrolls, they
@@ -123,7 +124,7 @@ def _draw_floor_and_grid(ax, extent: dict, spacing: float = DEFAULT_GRID_SPACING
     ax.add_collection3d(
         Poly3DCollection(
             [quad_plot], facecolors=FLOOR_COLOR, edgecolors="none",
-            alpha=0.55, zorder=0,
+            alpha=floor_alpha, zorder=0,
         )
     )
     # Grid lines (also at world y=0). Each line is a plot-coord segment.

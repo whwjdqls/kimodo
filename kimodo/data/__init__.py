@@ -5,6 +5,7 @@
 from .soma_text_motion import (
     SOMATextMotionDataset,
     SOMABonesSeedDataset,
+    SOMABonesSeedDatasetShapeAware,
     build_collate_fn,
 )
 from .humanml3d_text_motion import (
@@ -15,6 +16,7 @@ from .humanml3d_text_motion import (
 __all__ = [
     "SOMATextMotionDataset",
     "SOMABonesSeedDataset",
+    "SOMABonesSeedDatasetShapeAware",
     "build_collate_fn",
     "HumanML3DTextMotionDataset",
     "build_humanml3d_collate_fn",

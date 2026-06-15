@@ -174,7 +174,6 @@ class KimodoLoss(nn.Module):
         #               cancels on both sides, leaving a pure rotational-consistency
         #               loss. Use this with ``fk_kind="chainreset_hml3d"``.
         fk_kind: str = "standard",  # 'standard' | 'chainreset_hml3d' | 'hml3d_native'
-        fk_neutral_joints: Optional[torch.Tensor] = None,
         fk_chains: Optional[List[List[int]]] = None,
     ):
         super().__init__()
@@ -199,9 +198,9 @@ class KimodoLoss(nn.Module):
             )
             self.fk_chains = [list(c) for c in (fk_chains or HML3D_KINEMATIC_CHAIN)]
             # Register HumanML3D's axis-aligned unit offsets as a buffer so the
-            # FK runs on the model's device. NOTE: ``fk_neutral_joints`` is no
-            # longer used — HumanML3D's FK requires raw axis offsets multiplied
-            # by per-sample bone lengths, not the canonical T-pose bone vectors.
+            # FK runs on the model's device. HumanML3D's FK requires raw axis
+            # offsets multiplied by per-sample bone lengths, not the canonical
+            # T-pose bone vectors.
             self.register_buffer(
                 "fk_raw_offsets", HML3D_RAW_OFFSETS.clone().float(), persistent=False,
             )
@@ -223,6 +222,7 @@ class KimodoLoss(nn.Module):
     def _fk_world_from_pred(
         self, pred_un: torch.Tensor,
         bone_lengths: Optional[torch.Tensor] = None,
+        neutral_joints: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute (B, T, J, 3) world joint positions from unnormalized predictions.
 
@@ -290,7 +290,9 @@ class KimodoLoss(nn.Module):
         if self.fk_kind == "standard":
             from kimodo.skeleton.transforms import global_rots_to_local_rots
             pred_local_rot = global_rots_to_local_rots(pred_global_rot, mr.skeleton)
-            _, pred_posed, _ = mr.skeleton.fk(pred_local_rot, actual_root)
+            _, pred_posed, _ = mr.skeleton.fk(
+                pred_local_rot, actual_root, neutral_joints=neutral_joints,
+            )
             return pred_posed
         elif self.fk_kind == "chainreset_hml3d":
             # bone_lengths resolution:
@@ -331,6 +333,7 @@ class KimodoLoss(nn.Module):
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
+        neutral_joints: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run FK on predicted rotations and build a matching GT positions tensor.
 
@@ -384,7 +387,9 @@ class KimodoLoss(nn.Module):
                 device=target_un.device, dtype=target_un.dtype,
             )
 
-        pred_posed = self._fk_world_from_pred(pred_un, bone_lengths=bone_lengths)
+        pred_posed = self._fk_world_from_pred(
+            pred_un, bone_lengths=bone_lengths, neutral_joints=neutral_joints,
+        )
 
         if self.fk_target == "fk_gt":
             # Pure rotational-consistency target: run FK on the GT rotations
@@ -392,7 +397,9 @@ class KimodoLoss(nn.Module):
             # calibration cancels and the loss measures only rotational + root
             # errors.
             with torch.no_grad():
-                tgt_world = self._fk_world_from_pred(target_un, bone_lengths=bone_lengths)
+                tgt_world = self._fk_world_from_pred(
+                    target_un, bone_lengths=bone_lengths, neutral_joints=neutral_joints,
+                )
         elif self.fk_kind == "hml3d_native":
             # 263-D layout: recover world joint positions from the ric block
             # plus integrated root state. Mirrors HumanML3D's recover_from_ric.
@@ -458,6 +465,7 @@ class KimodoLoss(nn.Module):
         pred: torch.Tensor,            # (B, T, D) predicted clean motion (normalized)
         target: torch.Tensor,          # (B, T, D) ground-truth clean motion (normalized)
         pad_mask: torch.Tensor,        # (B, T) True for valid frames
+        neutral_joints: Optional[torch.Tensor] = None,  # (B, J, 3) per-sample neutrals; None → canonical
     ) -> Dict[str, torch.Tensor]:
         diff = self._smooth_l1(pred, target)  # (B, T, D)
         mask = pad_mask.float().unsqueeze(-1)  # (B, T, 1)
@@ -484,7 +492,7 @@ class KimodoLoss(nn.Module):
         fk_w = float(self.weights.get("fk", 0.0))
         fk_v_w = float(self.weights.get("fk_v", 0.0))
         if fk_w > 0.0 or fk_v_w > 0.0:
-            pred_posed, tgt_world = self._fk_positions(pred, target)
+            pred_posed, tgt_world = self._fk_positions(pred, target, neutral_joints=neutral_joints)
             if fk_w > 0.0:
                 fk_loss = self._fk_term(pred_posed, tgt_world, pad_mask)
                 losses["l_fk"] = fk_loss.detach()
