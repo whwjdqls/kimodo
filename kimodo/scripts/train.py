@@ -993,7 +993,15 @@ def load_checkpoint(
     device: torch.device,
 ) -> int:
     log.info("Resuming from %s", path)
-    obj = torch.load(path, map_location=device)
+    # Load onto CPU, not the GPU. map_location=device would materialize the full
+    # checkpoint (model weights + Adam moments [2x model] + EMA shadow) as a
+    # transient GPU duplicate on top of the already-resident model/EMA, leaving
+    # the caching allocator fragmented. At batch sizes that already fill ~93% of
+    # a 40 GB A100, that fragmentation makes the first training forward OOM even
+    # though steady-state training fits. load_state_dict copies in-place to the
+    # params' device (and torch's optimizer.load_state_dict re-homes the moments
+    # to each param's device), so CPU loading is correctness-neutral.
+    obj = torch.load(path, map_location="cpu")
     (denoiser.module if hasattr(denoiser, "module") else denoiser).load_state_dict(obj["denoiser"])
     if obj.get("optimizer"):
         optimizer.load_state_dict(obj["optimizer"])
@@ -1003,7 +1011,13 @@ def load_checkpoint(
         scaler.load_state_dict(obj["scaler"])
     if ema is not None and obj.get("ema"):
         ema.load_state_dict(obj["ema"])
-    return int(obj.get("step", 0))
+    step = int(obj.get("step", 0))
+    # Free the CPU checkpoint and release any cached GPU segments so training
+    # starts from a clean, unfragmented allocator.
+    del obj
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return step
 
 
 # -----------------------------------------------------------------------------

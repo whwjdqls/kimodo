@@ -26,6 +26,12 @@ conda activate kimodo
 
 cd /home/jungbin_cho/kimodo_open
 
+# Batch 128 already fills ~93% of a 40 GB A100. expandable_segments lets the
+# caching allocator reclaim fragmented blocks instead of stranding them, which
+# otherwise leaves the first post-resume forward without headroom. Belt-and-
+# suspenders with the CPU checkpoint-load fix in train.load_checkpoint.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # 8-GPU DDP via torchrun. Effective batch = 8 ranks * 128 per-rank = 1024.
 # Workers per rank reduced from 16 -> 8 so total workers (8*8 = 64) fits the
 # 64 CPUs we allocated.
