@@ -1,0 +1,89 @@
+# Train MDM (one-stage) on the UniEgoMotion-style 211-D representation, with a
+# CLIP ViT-B/32 text encoder. Same recipe as ``hml3d_native_mdm_clip.yaml``
+# (same model arch, lr, batch, steps, EMA, fp32) — only the data/rep differ, so
+# this is an apples-to-apples comparison of native-263 vs uniego-211.
+#
+# Run via:
+#     python -m kimodo.scripts.train_w_hml3d_uniego \\
+#         --config configs/training/hml3d_uniego_mdm_clip.yaml
+
+# ----- data -----
+data:
+  motion_dir: /home/jungbin_cho/HumanML3D/HumanML3D/uniego_rep      # .npz, key "features" (T,211)
+  text_dir:   /home/jungbin_cho/HumanML3D/HumanML3D/texts
+  split_file: /home/jungbin_cho/HumanML3D/HumanML3D/train.txt
+  mean_path:  /home/jungbin_cho/HumanML3D/HumanML3D/Mean_uniego.npy
+  std_path:   /home/jungbin_cho/HumanML3D/HumanML3D/Std_uniego.npy
+  fps: 20
+  window_size: 200
+  max_motion_length: 200
+  min_motion_len: 40
+  unit_length: 4
+  clip_normalized: null
+  num_workers: 8
+  pin_memory: true
+
+# ----- model -----
+model_config_path: /home/jungbin_cho/kimodo_open/configs/model/mdm_humanml3d_uniego_clip.yaml
+# stats_path is unused by the uniego motion_rep (mean/std come from absolute
+# paths); kept so build_denoiser_from_model_config doesn't choke on the key.
+stats_path: /home/jungbin_cho/HumanML3D/HumanML3D/stats_kimodo
+denoiser_fps_override: 20
+init_from_safetensors: null
+
+# ----- text encoder (CLIP ViT-B/32, MDM-style) -----
+text_encoder:
+  type: clip
+  model_name: openai/clip-vit-base-patch32
+  pooled: true
+  max_length: 22
+  device: auto
+  fp32: false
+
+# ----- training loop (identical to hml3d_native_mdm_clip.yaml) -----
+trainer:
+  output_dir: ${output_dir}
+  batch_size: 64
+  grad_accum: 1
+  num_steps: 500000
+  lr: 1.0e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  warmup_steps: 2000
+  log_every: 50
+  ckpt_every: 10000
+  viz_every: 10000
+  eval_every: 0
+  text_drop_prob: 0.1
+  ema_decay: 0.9999
+  ema_every: 1
+  mixed_precision: fp32
+  grad_clip: 1.0
+  grad_guard_max: 10.0
+  resume_from: null
+  seed: 0
+  fk_target: gt
+  # loss_weights / smooth_l1_beta / fk_* are IGNORED by the MDM flat masked-L2
+  # loss (kept for config parity with the native recipe).
+  loss_weights:
+    local_pose:    1.0
+    canon_delta:   1.0
+    foot_contacts: 1.0
+    fk:            0.0
+    fk_v:          0.0
+  smooth_l1_beta: 1.0
+  phase: text
+
+# ----- visualization -----
+viz:
+  num_samples: 0
+  prompts: []
+  num_frames: 100
+  num_denoising_steps: 50
+  cfg_scale: 2.5
+  test_vs_gt: true
+  test_split_file: /home/jungbin_cho/HumanML3D/HumanML3D/test.txt
+  num_test_samples: 4
+  test_max_frames: 196
+
+output_dir: /home/jungbin_cho/kimodo_open/runs/mdm_hml3d_uniego_fp32

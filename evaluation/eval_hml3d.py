@@ -212,11 +212,16 @@ from kimodo.metrics import (  # noqa: E402
 from kimodo.motion_rep.humanml3d_native import (  # noqa: E402
     hml3d_native_world_joints_from_features,
 )
+from kimodo.motion_rep.uniego import (  # noqa: E402
+    uniego_world_joints_from_features,
+)
 
 # Kimodo<->HumanML3D 263-D converter (lives in benchmark/).
 BENCHMARK_ROOT = Path("/home/jungbin_cho/kimodo_open/benchmark").resolve()
 sys.path.insert(0, str(BENCHMARK_ROOT))
 from humanml3d_to_kimodo import kimodo_to_humanml3d  # noqa: E402
+# UniEgo (211-D) -> HumanML3D 263 (chains uniego_to_kimodo -> kimodo_to_humanml3d).
+from kimodo_to_uniego import uniego_to_humanml3d  # noqa: E402
 
 log = logging.getLogger("eval_hml3d")
 
@@ -412,8 +417,21 @@ def _decode_gen_joints_contacts(
             )[0]  # (L, J, 3)
             joints[i, :L] = fk_joints
             contacts[i, :L] = (gen_unnorm[i, :L, c_sl] > 0.5).float()
+    elif D == 211:
+        # UniEgo head-centric 211-D: foot_contacts read from the features block;
+        # world joints decoded by cumulative-composing the residual canonical
+        # frame, then reading per-joint translations (no FK, no ambiguity — the
+        # rep stores joint positions directly, so there's a single view).
+        c_sl = motion_rep.slice_dict["foot_contacts"]
+        joints_full = uniego_world_joints_from_features(gen_unnorm)  # (B, pad_T, 22, 3)
+        for i in range(B):
+            L = min(int(m_lengths[i]), max_motion_length)
+            joints[i, :L] = joints_full[i, :L]
+            contacts[i, :L] = (gen_unnorm[i, :L, c_sl] > 0.5).float()
     else:
-        raise ValueError(f"unsupported motion_rep_dim={D}; expected 263 (native) or 273 (kimodo)")
+        raise ValueError(
+            f"unsupported motion_rep_dim={D}; expected 263 (native), 273 (kimodo) or 211 (uniego)"
+        )
     return joints, contacts
 
 
@@ -571,8 +589,22 @@ def sample_and_convert_batch(
             hml = kimodo_to_humanml3d(decode, device=device)  # (L, 263)
             # z-score with evaluator stats (matches what the loader does to GT).
             out[i, :L] = (hml - eval_mean_t) / eval_std_t
+    elif D == 211:
+        # UniEgo head-centric 211-D -> HumanML3D 263 via uniego_to_humanml3d
+        # (= uniego_to_kimodo -> kimodo_to_humanml3d). The generated features
+        # carry only the 211-D core (no aux velocities / r_rot_quat), so the
+        # decode recomputes world velocities from the decoded joint trajectory
+        # and the root yaw from the decoded root rotation — the correct decode
+        # for generated motion (mirrors the kimodo path's FK-velocity rebuild).
+        for i in range(B):
+            L = min(int(m_lengths[i]), max_motion_length)
+            ud = {"features": gen_unnorm[i, :L]}
+            hml = uniego_to_humanml3d(ud, device=device)  # (L, 263)
+            out[i, :L] = (hml - eval_mean_t) / eval_std_t
     else:
-        raise ValueError(f"unsupported motion_rep_dim={D}; expected 263 (native) or 273 (kimodo)")
+        raise ValueError(
+            f"unsupported motion_rep_dim={D}; expected 263 (native), 273 (kimodo) or 211 (uniego)"
+        )
     return out.cpu(), gen_unnorm
 
 
