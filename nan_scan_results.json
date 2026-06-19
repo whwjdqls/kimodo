@@ -1,0 +1,664 @@
+{
+  "root": "/home/jungbin_cho/seed/soma_uniform_motions_20fps",
+  "total_files": 142220,
+  "scanned": 142220,
+  "elapsed_sec": 168.0,
+  "thresholds": {
+    "rot_absmax": 1.05,
+    "rot_det_dev": 0.05,
+    "root_absmax": 1000.0,
+    "root_jump": 20.0
+  },
+  "counts": {
+    "clean": 142220,
+    "flagged": 0,
+    "load_error_corrupt": 0,
+    "empty": 0,
+    "missing_keys": 0,
+    "by_flag": {}
+  },
+  "distribution": {
+    "rot_absmax": {
+      "50": 1.0,
+      "90": 1.0,
+      "99": 1.0,
+      "99.9": 1.0,
+      "100": 1.0
+    },
+    "rot_det_dev": {
+      "50": 0.0,
+      "90": 0.0,
+      "99": 0.0,
+      "99.9": 0.0,
+      "100": 0.0
+    },
+    "root_absmax": {
+      "50": 1.0226,
+      "90": 5.1808,
+      "99": 8.9458,
+      "99.9": 11.0736,
+      "100": 12.712
+    },
+    "root_jump": {
+      "50": 0.0477,
+      "90": 0.1144,
+      "99": 0.1741,
+      "99.9": 0.266,
+      "100": 0.3631
+    }
+  },
+  "top_offenders": {
+    "rot_absmax": [
+      {
+        "file": "210707/walk_randdir_relax_003__A006.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_relax_003__A006_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_relax_003__A417.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_relax_003__A417_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_001__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_001__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_002__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_002__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_003__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_003__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_004__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_004__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_005__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_005__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_001__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_001__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_002__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_002__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_003__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_003__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_004__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_004__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_005__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_005__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_001__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_001__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_002__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_002__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_003__A057.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_003__A057_M.npz",
+        "rot_absmax": 1.0,
+        "flags": []
+      }
+    ],
+    "rot_det_dev": [
+      {
+        "file": "210707/walk_randdir_relax_003__A006.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_relax_003__A006_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_relax_003__A417.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_relax_003__A417_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_001__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_001__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_002__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_002__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_003__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_003__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_004__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_004__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_005__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_kick_trash_005__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_001__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_001__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_002__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_002__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_003__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_003__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_004__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_004__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_005__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_stoop_down_005__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_001__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_001__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_002__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_002__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_003__A057.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      },
+      {
+        "file": "211117/Neutral_throw_ball_003__A057_M.npz",
+        "rot_det_dev": 0.0,
+        "flags": []
+      }
+    ],
+    "root_absmax": [
+      {
+        "file": "230105/jog_ff_loop_180_R_002__A107.npz",
+        "root_absmax": 12.712,
+        "flags": []
+      },
+      {
+        "file": "230105/jog_ff_loop_180_R_002__A107_M.npz",
+        "root_absmax": 12.7092,
+        "flags": []
+      },
+      {
+        "file": "230105/jog_ff_loop_180_R_003__A107.npz",
+        "root_absmax": 12.6952,
+        "flags": []
+      },
+      {
+        "file": "230105/jog_ff_loop_180_R_003__A107_M.npz",
+        "root_absmax": 12.6938,
+        "flags": []
+      },
+      {
+        "file": "230105/jog_ff_loop_180_R_003__A108_M.npz",
+        "root_absmax": 12.5906,
+        "flags": []
+      },
+      {
+        "file": "230105/jog_ff_loop_180_R_003__A108.npz",
+        "root_absmax": 12.5897,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_injured_torso_001__A006_M.npz",
+        "root_absmax": 12.4788,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_injured_torso_001__A006.npz",
+        "root_absmax": 12.4742,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_injured_R_leg_002__A005_M.npz",
+        "root_absmax": 12.2108,
+        "flags": []
+      },
+      {
+        "file": "210707/walk_randdir_injured_R_leg_002__A005.npz",
+        "root_absmax": 12.2086,
+        "flags": []
+      },
+      {
+        "file": "220714/jog_forward_start_002__A026.npz",
+        "root_absmax": 12.1704,
+        "flags": []
+      },
+      {
+        "file": "220714/jog_forward_start_002__A026_M.npz",
+        "root_absmax": 12.1693,
+        "flags": []
+      },
+      {
+        "file": "220727/jog_forward_loop_002__A037.npz",
+        "root_absmax": 12.0187,
+        "flags": []
+      },
+      {
+        "file": "220727/jog_forward_loop_002__A037_M.npz",
+        "root_absmax": 12.0179,
+        "flags": []
+      },
+      {
+        "file": "220720/jog_sideway_left_loop_002__A029.npz",
+        "root_absmax": 12.0008,
+        "flags": []
+      },
+      {
+        "file": "220720/jog_sideway_left_loop_002__A029_M.npz",
+        "root_absmax": 12.0007,
+        "flags": []
+      },
+      {
+        "file": "220720/jog_sideway_right_loop_001__A029_M.npz",
+        "root_absmax": 11.9969,
+        "flags": []
+      },
+      {
+        "file": "220720/jog_sideway_right_loop_001__A029.npz",
+        "root_absmax": 11.9955,
+        "flags": []
+      },
+      {
+        "file": "220727/jog_backward_loop_002__A037.npz",
+        "root_absmax": 11.9135,
+        "flags": []
+      },
+      {
+        "file": "220727/jog_backward_loop_002__A037_M.npz",
+        "root_absmax": 11.9125,
+        "flags": []
+      },
+      {
+        "file": "220720/jog_sideway_left_loop_003__A029.npz",
+        "root_absmax": 11.8644,
+        "flags": []
+      },
+      {
+        "file": "220720/jog_sideway_left_loop_003__A029_M.npz",
+        "root_absmax": 11.8629,
+        "flags": []
+      },
+      {
+        "file": "221011/jog_ff_loop_180_R_003__A049.npz",
+        "root_absmax": 11.8249,
+        "flags": []
+      },
+      {
+        "file": "221011/jog_ff_loop_180_R_003__A049_M.npz",
+        "root_absmax": 11.8247,
+        "flags": []
+      },
+      {
+        "file": "230105/jog_ff_loop_180_R_002__A108_M.npz",
+        "root_absmax": 11.8117,
+        "flags": []
+      },
+      {
+        "file": "230105/jog_ff_loop_180_R_002__A108.npz",
+        "root_absmax": 11.8106,
+        "flags": []
+      },
+      {
+        "file": "220727/jog_forward_loop_001__A037_M.npz",
+        "root_absmax": 11.7677,
+        "flags": []
+      },
+      {
+        "file": "220727/jog_forward_loop_001__A037.npz",
+        "root_absmax": 11.7671,
+        "flags": []
+      },
+      {
+        "file": "220720/jog_sideway_right_loop_003__A029_M.npz",
+        "root_absmax": 11.764,
+        "flags": []
+      },
+      {
+        "file": "220720/jog_sideway_right_loop_003__A029.npz",
+        "root_absmax": 11.7639,
+        "flags": []
+      }
+    ],
+    "root_jump": [
+      {
+        "file": "230324/fall_from_2m_panic_180_R_003__A304_M.npz",
+        "root_jump": 0.3631,
+        "flags": []
+      },
+      {
+        "file": "230324/fall_from_2m_panic_180_R_003__A304.npz",
+        "root_jump": 0.3624,
+        "flags": []
+      },
+      {
+        "file": "230324/fall_from_2m_panic_180_R_002__A304_M.npz",
+        "root_jump": 0.3617,
+        "flags": []
+      },
+      {
+        "file": "230324/fall_from_2m_panic_180_R_002__A304.npz",
+        "root_jump": 0.3617,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_270_R_003__A327.npz",
+        "root_jump": 0.3157,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_270_R_003__A327_M.npz",
+        "root_jump": 0.3155,
+        "flags": []
+      },
+      {
+        "file": "230531/tiger_jump_to_shoulder_roll_R_003__A415_M.npz",
+        "root_jump": 0.3088,
+        "flags": []
+      },
+      {
+        "file": "230531/tiger_jump_to_shoulder_roll_R_003__A415.npz",
+        "root_jump": 0.3087,
+        "flags": []
+      },
+      {
+        "file": "230531/tiger_jump_to_shoulder_roll_R_002__A415_M.npz",
+        "root_jump": 0.3052,
+        "flags": []
+      },
+      {
+        "file": "230531/tiger_jump_to_shoulder_roll_R_002__A415.npz",
+        "root_jump": 0.3051,
+        "flags": []
+      },
+      {
+        "file": "230424/turn_run_270_R_003__A349_M.npz",
+        "root_jump": 0.3032,
+        "flags": []
+      },
+      {
+        "file": "230424/turn_run_270_R_003__A349.npz",
+        "root_jump": 0.3029,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_270_R_002__A327.npz",
+        "root_jump": 0.3016,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_270_R_002__A327_M.npz",
+        "root_jump": 0.3014,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_270_R_001__A327.npz",
+        "root_jump": 0.3012,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_270_R_001__A327_M.npz",
+        "root_jump": 0.301,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_270_R_003__A326_M.npz",
+        "root_jump": 0.3001,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_270_R_003__A326.npz",
+        "root_jump": 0.2999,
+        "flags": []
+      },
+      {
+        "file": "230531/tiger_jump_to_shoulder_roll_R_001__A415.npz",
+        "root_jump": 0.2999,
+        "flags": []
+      },
+      {
+        "file": "230531/tiger_jump_to_shoulder_roll_R_001__A415_M.npz",
+        "root_jump": 0.2997,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_360_R_003__A327.npz",
+        "root_jump": 0.299,
+        "flags": []
+      },
+      {
+        "file": "230424/turn_run_270_R_001__A349.npz",
+        "root_jump": 0.299,
+        "flags": []
+      },
+      {
+        "file": "230418/run_stop_180_R_001__A331_M.npz",
+        "root_jump": 0.2988,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_360_R_003__A327_M.npz",
+        "root_jump": 0.2988,
+        "flags": []
+      },
+      {
+        "file": "230424/turn_run_270_R_001__A349_M.npz",
+        "root_jump": 0.2986,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_360_R_001__A326_M.npz",
+        "root_jump": 0.2986,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_360_R_003__A326_M.npz",
+        "root_jump": 0.2986,
+        "flags": []
+      },
+      {
+        "file": "230418/run_stop_180_R_001__A331.npz",
+        "root_jump": 0.2985,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_360_R_001__A326.npz",
+        "root_jump": 0.2984,
+        "flags": []
+      },
+      {
+        "file": "230417/turn_run_360_R_003__A326.npz",
+        "root_jump": 0.2983,
+        "flags": []
+      }
+    ]
+  },
+  "corrupt_files": [],
+  "empty_files": [],
+  "missing_files": [],
+  "flagged_files": []
+}

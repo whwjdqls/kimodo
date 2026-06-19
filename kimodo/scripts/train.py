@@ -78,7 +78,15 @@ def setup_distributed() -> DistEnv:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", rank % max(1, torch.cuda.device_count())))
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        # Generous collective timeout (NCCL default is 10 min). Rank-0-only work
+        # at step boundaries — checkpoint save + viz (matplotlib render of several
+        # MP4s) — makes ranks 1..N-1 block at the next all-reduce. On reduced-CPU
+        # runs that render can exceed 10 min and the NCCL watchdog SIGABRTs the
+        # waiting ranks (observed at step 225000). 60 min gives ample margin.
+        from datetime import timedelta
+        dist.init_process_group(
+            "nccl", rank=rank, world_size=world_size, timeout=timedelta(minutes=60),
+        )
         torch.cuda.set_device(local_rank)
         return DistEnv(world_size, rank, local_rank, is_distributed=True)
     return DistEnv(world_size=1, rank=0, local_rank=0, is_distributed=False)
@@ -944,9 +952,16 @@ def train_one_step(
             motion_mask=motion_mask,
             observed_motion=observed_motion,
         )
-        # Cast to float32 for loss computation (stability with bf16 forward).
-        pred_clean = pred_clean.float()
-        losses = loss_fn(pred_clean, motion, pad_mask)
+
+    # Loss (incl. FK) is computed OUTSIDE the autocast context so its matmuls —
+    # cont6d_to_matrix and skeleton.fk's rotation-chain composition — run in
+    # fp32, not bf16. autocast downcasts matmul/bmm/linear ops *inside* its scope
+    # regardless of input dtype, so casting pred_clean to float alone does NOT
+    # make the FK fp32. The FK accumulates rotations down the kinematic chain,
+    # where bf16's ~8-bit mantissa compounds error and degrades the gradients for
+    # the fk / local_joints_positions terms. The denoiser forward stays bf16.
+    pred_clean = pred_clean.float()
+    losses = loss_fn(pred_clean, motion, pad_mask)
     # Cheap data-sanity signals for spotting representation/normalization issues.
     # (Logged to TB; a healthy normalized batch is usually within ~[-5, 5].)
     losses["data_absmax"] = motion.detach().abs().max()

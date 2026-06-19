@@ -510,7 +510,18 @@ class SOMABonesSeedDataset(Dataset):
             )
         except (RuntimeError, TypeError):
             blob = torch.load(str(path), map_location="cpu", weights_only=False)
-        self._packed_feat_idx = {n: i for i, n in enumerate(blob["names"])}
+        # Key by BASENAME: pack names carry the split's subdir prefix
+        # (e.g. "220705/Idle_Left_001__A017") but entry.filename is the bare
+        # basename from the metadata. Without this, every lookup misses and the
+        # dataset silently falls back to the slow NFS NPZ path.
+        names = blob["names"]
+        self._packed_feat_idx = {os.path.basename(n): i for i, n in enumerate(names)}
+        if len(self._packed_feat_idx) != len(names):
+            log.warning(
+                "packed features: %d basename collisions among %d names — "
+                "some motions will resolve to the wrong features",
+                len(names) - len(self._packed_feat_idx), len(names),
+            )
         self._packed_feat_offsets = blob["offsets"]
         self._packed_features_tensor = blob["features"]
         self._packed_features = True
@@ -539,7 +550,15 @@ class SOMABonesSeedDataset(Dataset):
         except (RuntimeError, TypeError):
             # Older PyTorch / legacy serialization — load without mmap.
             blob = torch.load(str(path), map_location="cpu", weights_only=False)
-        self._packed_names_idx = {n: i for i, n in enumerate(blob["names"])}
+        # Key by basename (pack names carry the split subdir prefix; entry.filename
+        # is the bare basename) — otherwise every lookup misses -> NFS fallback.
+        names = blob["names"]
+        self._packed_names_idx = {os.path.basename(n): i for i, n in enumerate(names)}
+        if len(self._packed_names_idx) != len(names):
+            log.warning(
+                "packed motions: %d basename collisions among %d names",
+                len(names) - len(self._packed_names_idx), len(names),
+            )
         self._packed_offsets = blob["offsets"]
         self._packed_local_rot = blob["local_rot_mats"]
         self._packed_root_pos = blob["root_positions"]
