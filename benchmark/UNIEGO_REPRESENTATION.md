@@ -297,11 +297,10 @@ canonical body, so the plain uniego conversion captures pose-only (great for the
 text-to-motion test). **Per-actor shape** lives in BONES-SEED's proportional tree
 (per-actor `neutral_joints`) and is central to Nymeria.
 
-> **NymeriaPlus is not on this machine** (no data, configs, or code references).
-> The converter above is the template: once a Nymeria SOMA `.npz` (or 369-D
-> features) is mounted, the same `soma_to_uniego` path applies (J/head/foot as
-> SOMA). Nymeria's extra modalities (egocentric video, camera extrinsics, HMD
-> trajectory) have **no representation/loader in this repo yet** — net-new work.
+> **NymeriaPlus converter now exists — see §15.** (Data lives on `/weka`, not in this
+> repo tree.) The egocentric modalities (video, camera, floor grounding) are built out
+> in `/home/jungbin_cho/nymeria_kimodo_pipeline/` (video mp4s + camera sidecars +
+> manifest); the uniego motion rep for it is `benchmark/nymeria_to_uniego.py`.
 
 ## 14. Is the head-centric rep good for **shape-aware** generation?
 
@@ -350,3 +349,98 @@ and aligns with the head/device — provided you (a) condition on shape and (b) 
 bone-length-consistency regularizer (or use the rotation-view FK decode for
 shape-exactness). The uniform-SOMA conversion here is shape-free (canonical body);
 the shape-aware variant needs the proportional tree mounted (currently on `/weka`).
+
+---
+
+## 15. NymeriaPlus converter (shape-aware, ran on all 732)
+
+`benchmark/nymeria_to_uniego.py` — the SOMA-30 uniego rep (**283-D**, head_idx 6,
+n_foot 4) for the shape-aware NymeriaPlus motions at
+`/weka/jungbin/nymeriaplus_kimodo_proportional/{Sxx}/{seq}.npz`. Unlike the raw
+BONES-SEED SOMA `.npz` (which already carry global SE(3)), the proportional NPZs store
+**local** rotations + a per-actor rest skeleton, so the converter runs FK first:
+
+1. **FK (77)** `SOMASkeleton77.fk(local_rot_mats, root, neutral_joints)` →
+   `global_rot_mats`, `posed_joints`. Runs on **this actor's** `neutral_joints`, so the
+   joint positions carry per-actor bone lengths → the uniego rep is **shape-aware for
+   free** (§14). 2. **slice** 77→30. 3. **feet** — per-frame *local-floor* contacts
+   (below). 4. `kimodo_to_uniego(head_idx=6, n_foot=4)` → `features (T,283)`.
+
+**Grounding (important, differs from the HML3D/SOMA path).** Positions are kept **RAW**
+(`grounded=False`, the proportional NPZ's own convention — raw SLAM-world height).
+Downstream windowed training grounds each window by the floor pipeline's per-slice
+`ground_offset_y` (subtract from the per-joint trans-Y block; rotations + canonical
+`delta` unaffected) — **exactly how the aligned video + camera + motion are grounded**
+in `nymeria_kimodo_pipeline/video/manifest_video.jsonl`. `--ground` bakes whole-seq
+`floor_offset` (lowest-floor) instead, but that mis-grounds multi-floor clips.
+
+**Foot contacts vs a local floor.** The rep's plain `foot_detect_from_pos_and_vel`
+gates on absolute foot height above a single global floor — wrong for raw / multi-floor
+Nymeria (it zeroed ~40% of contacts: median contact_frac 0.015, 41% of seqs <1%).
+`_robust_foot_contacts` instead estimates a **per-frame local floor** (10th-percentile
+of min foot height over ±20 frames) and gates on (foot within 0.10 m of it) AND (speed
+< 0.15 m/s) — grounding- and stairs-independent. Post-fix over all 732: contact_frac
+**mean 0.69 / median 0.69 / p10 0.50, 0 seqs <1%**.
+
+**Round-trip precision.** Per-window (training use, frame-0 re-canonicalized per §10):
+**float32-exact ~2–9e-5 (PASS <1e-4)**. Whole-sequence cumulative decode drifts to
+~1–2 mm on these ~19k-frame (16-min) clips — inherent to the residual-canonical-frame
+encoding over very long sequences (BONES-SEED clips ≤201 frames hit 2e-5), physically
+negligible (< the SMPL fit's ~1.6 mm/frame foot jitter). `--verify-roundtrip` reports
+both.
+
+**Output** `uniego_rep/{Sxx}/{seq}.npz`: `features (T,283)`, `foot_contacts (T,4)`,
+`neutral_joints (30,3)` [SOMA-30, per-actor — feed the `ShapeEncoder`], `identity_coeffs
+(1,10)`, `floor_offset`, `grounded` (False), `fps`, **`timestamps_us (T,)`** (so the rep
+stays frame-aligned 1:1 with the ego video / camera / motion windows). All 732 motion
+NPZs converted (0 errors, ~15 GB).
+
+```bash
+# verify (per-window + whole-seq):
+python benchmark/nymeria_to_uniego.py --verify-roundtrip 6 --skip-write
+# convert all 732 (CPU; ssh into an a3ultra node, do NOT srun a GPU node for CPU work):
+python benchmark/nymeria_to_uniego.py --workers 24 --overwrite
+```
+
+---
+
+## 16. Proportional BONES-SEED converter (shape-aware, ran on all 142,220)
+
+`benchmark/soma_proportional_to_uniego.py` — the SOMA-30 uniego rep (**283-D**) for the
+**shape-aware** BONES-SEED motions at `/weka/jungbin/seed/soma_proportional_motions_20fps`
+→ `/weka/jungbin/seed/soma_proportional_uniegomotion_20fps` (date-subdir structure
+preserved). Distinct from §12's `soma_to_uniego.py` (uniform / shape-free set) in two ways:
+
+- The proportional NPZs were FK'd on **each actor's own rest skeleton**, so the
+  precomputed `posed_joints` carry per-actor bone lengths → the uniego rep is
+  **shape-aware for free**. We also **carry the per-actor `neutral_joints` (30,3)** into
+  each output for downstream `ShapeEncoder` conditioning (the uniform set has none).
+- The NPZs already store precomputed `global_rot_mats` + `posed_joints` + `foot_contacts`,
+  and the BVH source is **floor-referenced** (min foot Y ≈ +0.01 m). So — unlike the raw
+  Nymeria path (§15) — no FK, no grounding, and no foot re-detection: contacts pass
+  straight through (contact_frac mean 0.75).
+
+**Output `{date}/{name}.npz`:** `features (T,283)`, `foot_contacts (T,4)`,
+`neutral_joints (30,3)` [SOMA-30, per-actor].
+
+**Verification** (`_verify.json`, 200 random files): feature dim 283, **0 NaN**, stored
+features == recomputed (Δ=0, deterministic), round-trip decode→joints `posed_joints`
+**4.9e-5** / `global_rot_mats` 3.7e-5 (PASS <1e-4), `foot_contacts` == source (Δ=0).
+Clips short (T 44–789) so no long-sequence drift. Reproduce:
+`python benchmark/soma_proportional_to_uniego.py --verify-roundtrip 12 --skip-write`.
+
+**Stats** (`_stats.json`, `Mean_uniego.npy` / `Std_uniego.npy`, 283-D): computed over
+the **141,541 clean** clips (20,667,071 frames) by `compute_uniego_stats.py --n-joints 30`.
+**7 structurally-constant dims** `[60,62, 271,273,274,275,277]` (std floored to 1.0) =
+the expected invariants — head joint local x/z (the canonical anchor) + canonical-delta
+pure-yaw 6D + zeroed-height — a correctness check.
+
+**Data-quality caveat — 679 corrupt SOURCE clips (0.48%).** `_nan_files.txt` lists 679
+files whose features contain NaN. The NaN is **pre-existing in the source**
+(`soma_proportional_motions_20fps`'s own `local_rot_mats`/`global_rot_mats`/`posed_joints`
+are NaN for these clips — verified) — the converter faithfully propagated it, it is not a
+conversion bug. These are **excluded from the normalization stats** (`_clean_ids.txt` =
+141,541 vs `_all_ids.txt` = 142,220) and should be filtered downstream.
+
+**Run:** all 142,220 converted, 0 conversion errors, ~23 GB. CPU — ssh into an a3ultra
+node (`--workers 32`), do NOT srun a GPU node for CPU work.
